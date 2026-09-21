@@ -1,5 +1,6 @@
 """Train a LightGBM model to predict taxi-out time and write a submission file."""
 
+import argparse
 import glob
 from pathlib import Path
 
@@ -13,6 +14,9 @@ from sklearn.metrics import root_mean_squared_error
 CONGESTION_WINDOW_MINUTES = 60       # easy to tune
 CONGESTION_WINDOW_SHORT_MINUTES = 10 # short window for acceleration signal
 MIN_DAY_FLIGHTS = 5  # completed flights required before day_deviation_ratio fires
+# A date-rollover artifact records AOBT and MVT_TIME a full day apart; no genuine
+# taxi lasts this long, so proxy_taxi above this threshold flags the artifact.
+ARTIFACT_PROXY_THRESHOLD_SEC = 50000
 
 DATA_DIR = Path(__file__).parent
 PREDICTIONS_DIR = DATA_DIR / "predictions"
@@ -20,7 +24,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 18
+SUBMISSION_VERSION = 20
 
 FEATURE_FRACTION = 0.8
 ENSEMBLE_SEEDS = [42, 123, 456, 789, 1337, 2024, 31337, 99999, 7777]
@@ -306,31 +310,34 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     # template may not share the same row order
     pred_series = pd.Series(predictions, index=deps.index)
 
-    # The surveillance data has a date-rollover bug at LIRF: when a flight's
-    # actual pushback falls just before midnight UTC, BLOCK_TIME_UTC_mvt is
-    # recorded one calendar day too early, inflating TAXITIME by 86400s in the
-    # ground truth. These rows are identifiable because AOBT_3_flt (correct)
-    # shows hour=23 while MVT_TIME_UTC_mvt (correct) shows hour=0.
+    # The surveillance data carries a date-rollover artifact (seen at LIRF, LFPG
+    # and LSZH in training): a data-entry error records AOBT_3_flt and
+    # MVT_TIME_UTC_mvt a full calendar day apart. The ground-truth TAXITIME
+    # (MVT_TIME - BLOCK_TIME, with BLOCK_TIME tracking AOBT) is then ~86400s.
+    # These rows are identifiable because proxy_taxi (MVT_TIME - AOBT_3_flt)
+    # exceeds a full day, which no genuine taxi does. Training confirms proxy_taxi
+    # closely matches the buggy ground-truth TAXITIME, so predicting proxy_taxi
+    # directly is the best available estimate. Detection is airport-agnostic
+    # because the artifact is not specific to any one airport.
+    #
+    # Flights that merely push back just before midnight (AOBT hour 23, MVT hour
+    # 0) are NOT artifacts: in training their true TAXITIME is a normal 350-5700s
+    # and BLOCK_TIME correctly rolls to the next day. They are left to the model.
     proxy_taxi = (deps["MVT_TIME_UTC_mvt"] - deps["AOBT_3_flt"]).dt.total_seconds()
-    midnight_crossover = (
-        (deps["ADEP_mvt"] == "LIRF")
-        & (deps["AOBT_3_flt"].dt.hour == 23)
-        & (deps["MVT_TIME_UTC_mvt"].dt.hour == 0)
-    )
-    # A separate class of bug: AOBT_3_flt itself has the wrong date (one day
-    # early), making proxy_taxi ≈ 86400s. If BLOCK_TIME has the same error the
-    # ground-truth TAXITIME is also ≈ proxy_taxi, so predicting proxy_taxi
-    # directly is the best available estimate.
-    aobt_date_error = (deps["ADEP_mvt"] == "LIRF") & (proxy_taxi > 50000)
-    artifact_mask = midnight_crossover | aobt_date_error
-    n_artifacts = artifact_mask.sum()
+    artifact_mask = proxy_taxi > ARTIFACT_PROXY_THRESHOLD_SEC
+    n_artifacts = int(artifact_mask.sum())
     if n_artifacts > 0:
-        print(f"  Overriding {n_artifacts} artifact row(s) at LIRF")
-        # midnight-crossover rows: proxy_taxi is correct, BLOCK_TIME is wrong by 1 day
-        pred_series.loc[midnight_crossover] = proxy_taxi[midnight_crossover] + 86400
-        # AOBT date-error rows: proxy_taxi ≈ ground truth TAXITIME
-        aobt_only = aobt_date_error & ~midnight_crossover
-        pred_series.loc[aobt_only] = proxy_taxi[aobt_only]
+        airports = deps.loc[artifact_mask, "ADEP_mvt"].value_counts().to_dict()
+        print(f"  Date-rollover override: {n_artifacts} row(s) at {airports}")
+        for idx in deps.index[artifact_mask]:
+            assigned = proxy_taxi[idx]
+            print(
+                f"    {deps.at[idx, 'ADEP_mvt']} MVT_ID={deps.at[idx, 'MVT_ID_mvt']} "
+                f"proxy_taxi={assigned:.0f}s -> assigned {assigned:.0f}s"
+            )
+        pred_series.loc[artifact_mask] = proxy_taxi[artifact_mask]
+    else:
+        print("  Date-rollover override: no artifact rows detected")
 
     # The artifact override runs after the initial np.clip, so re-clip to keep any
     # negative proxy_taxi values out of the submission.
@@ -350,6 +357,18 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
 
 def main() -> None:
     """Run the full pipeline: load data, validate, train on all data, write submission."""
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Train a single seed instead of the full ensemble for faster iteration "
+        "(lower accuracy; use when validating pipeline changes, not for final runs)",
+    )
+    args = parser.parse_args()
+    seeds = ENSEMBLE_SEEDS[:1] if args.fast else ENSEMBLE_SEEDS
+    if args.fast:
+        print(f"FAST MODE: using {len(seeds)} seed (reduced accuracy)\n")
+
     print("Loading training data...")
     movements = load_movements()
     df = load_training_data(movements)
@@ -378,20 +397,20 @@ def main() -> None:
     X_train, y_train, X_val, y_val = time_based_split(df, features, target)
     print(f"  Train: {len(X_train):,} rows  |  Val: {len(X_val):,} rows")
 
-    print(f"Training validation ensemble ({len(ENSEMBLE_SEEDS)} seeds)...")
+    print(f"Training validation ensemble ({len(seeds)} seeds)...")
     val_preds_all = []
-    for i, seed in enumerate(ENSEMBLE_SEEDS, 1):
+    for i, seed in enumerate(seeds, 1):
         m = train(X_train, y_train, seed=seed)
         val_preds_all.append(m.predict(X_val))
         rmse = root_mean_squared_error(y_val, np.mean(val_preds_all, axis=0))
-        print(f"  seed {i}/{len(ENSEMBLE_SEEDS)}: ensemble RMSE={rmse:.1f}s")
+        print(f"  seed {i}/{len(seeds)}: ensemble RMSE={rmse:.1f}s")
     print(f"\nValidation RMSE: {rmse:.1f} seconds ({rmse/60:.2f} minutes)\n")
 
-    print(f"Training final ensemble on all data ({len(ENSEMBLE_SEEDS)} seeds)...")
+    print(f"Training final ensemble on all data ({len(seeds)} seeds)...")
     final_models = []
-    for i, seed in enumerate(ENSEMBLE_SEEDS, 1):
+    for i, seed in enumerate(seeds, 1):
         final_models.append(train(features, target, seed=seed))
-        print(f"  seed {i}/{len(ENSEMBLE_SEEDS)} done")
+        print(f"  seed {i}/{len(seeds)} done")
 
     print("Writing submission file...")
     write_submission(final_models, SUBMISSION_VERSION)
