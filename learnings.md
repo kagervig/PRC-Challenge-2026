@@ -1,5 +1,73 @@
 # Model Run Learnings
 
+## Approach Rationale
+
+### Model: LightGBM
+
+LightGBM gradient boosting was selected from the start and never changed.
+
+**Why LightGBM:**
+- Handles missing values natively — NaN rows are routed to a learned child node rather than requiring imputation. This is critical: several of our key features (congestion signal, AOBT_3_flt, gate delay) have 0.5–1.5% NaN rates, and some are NaN for entire subpopulations (ranking DEP rows lack BLOCK_TIME entirely).
+- First-class categorical feature support — airport, runway, stand, airline, weight class, and market segment are all high-cardinality categoricals. LightGBM finds optimal groupings via gradient-based splitting rather than requiring one-hot encoding.
+- Fast training — 2 million rows × 15 features × 3,000 rounds trains in minutes on CPU. This iteration speed was essential for the feature sweep + hyperparameter tuning work.
+- Interpretable feature importance — gain-based importances guided every decision about what to add, keep, and revert.
+- Strong track record on tabular regression with mixed feature types at this scale.
+
+**Alternatives considered:**
+
+| Alternative | Why not adopted |
+|---|---|
+| XGBoost | Similar predictive power but slower on CPU (column-wise vs. leaf-wise split finding) and less flexible NaN handling. No clear benefit over LightGBM for this dataset. |
+| CatBoost | Excellent categorical handling and strong on small datasets, but slower to train and less iteration-friendly. The gain over LightGBM for purely tabular regression is typically small. |
+| Neural networks (MLP, TabNet) | Potentially capture deeper interactions but: slower to iterate, harder to debug feature contributions, and consistently outperformed by tree ensembles on tabular data with this many rows and feature types. Not worth the iteration cost for a competition with a fixed deadline. |
+| Linear regression / ridge | Too simple — taxi time has strong non-linear interactions (e.g. congestion × airport × hour). Useful only as a sanity check baseline. |
+| Random forest | Competitive baseline but gradient boosting with `num_boost_round=3000` consistently outperforms random forests on tabular regression. Random forests also require more trees for equivalent accuracy. |
+| Per-airport models | Tested (see v10 attempt above). Resulted in 388.2s — worse than pooled model. Each airport gets far fewer training rows; the model loses the cross-airport generalisation that helps calibrate shared features like congestion and schedule delay. |
+
+### Validation strategy: time-based split
+
+An 83%/17% split by timestamp (approximately Jan–Oct 2025 train, Nov–Dec 2025 val) was used throughout.
+
+**Why time-based:** Flight taxi time has temporal structure. The congestion signal is a rolling window over past completed flights — a random split would contaminate training with future flights that appeared in the congestion windows of training examples. Any feature that looks backward over real time is vulnerable to this. A time-based split preserves causal ordering.
+
+**Why not k-fold CV:** Standard k-fold mixes time periods and leaks temporal features. Blocked time-series CV would be more rigorous (multiple train/val windows), but the computational cost (9 seeds × 5 folds = 45 models per experiment) made it impractical for the feature sweep pace we needed.
+
+**Known limitation:** Our validation window (Nov–Dec 2025) is only 2 months and includes winter holiday patterns. The ranking data spans 9 months (Jan–Sep 2026) with different seasonal structure. Any distribution shift between those periods is invisible in our validation RMSE, as discussed in the Official Score Gap section.
+
+### Ensemble: multi-seed with feature subsampling
+
+The final model is an average of 9 LightGBM models trained with the same hyperparameters but different random seeds and `feature_fraction=0.8`.
+
+**What each model does:** All 9 models are identical in purpose — each is a full LightGBM regressor trained on the same training data, with the same hyperparameters, predicting `TAXITIME_SEC_mvt`. They are not specialised. There is no model dedicated to a specific airport, time of day, or flight type. The only difference between them is the random seed, which controls which 80% of features are considered at each tree split.
+
+**Why seeds produce different models:** At every node in every tree, LightGBM considers splitting on a random subset of features (80% here). Different seeds draw different subsets, so the trees end up with different structure — one model might split first on `congestion_signal`, another on `schedule_delay_sec`, producing different learned thresholds and different predictions for the same flight. The predictions from all 9 models are then averaged:
+
+```python
+np.mean([m.predict(features) for m in models], axis=0)
+```
+
+**Why averaging helps:** The 9 models make partially uncorrelated errors — where one model is wrong high, another is less wrong. When you average partially uncorrelated predictions, the random errors cancel and the systematic signal remains. This reduces variance without introducing bias. It is the same principle as random forests, applied to gradient boosting.
+
+**Why `feature_fraction` is the diversity mechanism:** Without it (`feature_fraction=1.0`), LightGBM's split-finding is deterministic given the same data and features. All 9 seeds produce structurally identical trees, and averaging provides no benefit.
+
+**Alternatives considered:**
+
+| Alternative | Why not adopted |
+|---|---|
+| Multi-algorithm ensemble (LGB + XGB + CatBoost) | Higher diversity but 3× the training time and complexity. The marginal RMSE gain rarely justifies it; single-algorithm ensembles are easier to tune and deploy. |
+| Stacking (meta-learner over base model predictions) | Adds another layer of training and validation management. Stacking helps most when base models have complementary error patterns — here all models are LightGBM variants with correlated errors. |
+| Bagging fraction (row subsampling) | Tested. All bagging fractions worse than baseline (see Hyperparameter Sweep section). At 3,000 rounds, the model needs the full dataset to converge; reducing rows hurts more than it diversifies. |
+
+### Feature engineering philosophy
+
+Features were added one at a time, tested against the baseline, and reverted if neutral or negative. No automated feature generation was used.
+
+The design principle was physical causation: if a feature has a plausible mechanism for affecting taxi-out time (congestion pressure, schedule adherence, stand position, operational disruption), it was worth testing. Features with no clear mechanism but high apparent correlation were treated with suspicion (potential data leakage or spurious correlation on the training period).
+
+The leakage discovery (`MVT_TIME_UTC_mvt` has r = −1.0 with the target) confirmed this caution was warranted. Two columns that appear useful — arrival time and actual runway time — are definitionally derived from the target and cannot be used.
+
+---
+
 ## v1 — Baseline
 **Validation RMSE: 395.9s (6.60 min)**
 
@@ -129,6 +197,31 @@ LIRF RMSE: 1030.7s (was 1076.4s). Non-LIRF RMSE: 242.6s (was 262.8s).
 For each departure, computes the ratio of mean taxi time of completed flights at the same airport since midnight UTC vs that airport's long-run mean. A ratio of 1.5 means the airport is running 50% slower than normal today. Fires after 5 completed flights; NaN before that.
 
 Signal populated for 2,056,622 / 2,085,047 rows (98.6%). Gain is modest globally because disruption days are rare (21 days across the training set), but the feature is directionally correct and costs little.
+
+---
+
+## Plan Experiments — All Reverted
+
+Baseline: **244.0s** (v9, after artifact filter)
+
+| Experiment | Detail | RMSE (s) | Delta | Decision |
+|---|---|---|---|---|
+| Huber loss alpha=50 | Huber threshold 50s | 289.7 | +45.7 | Reverted |
+| Huber loss alpha=100 | Huber threshold 100s | 272.7 | +28.7 | Reverted |
+| Huber loss alpha=200 | Huber threshold 200s | 257.4 | +13.4 | Reverted |
+| Huber loss alpha=400 | Huber threshold 400s | 246.1 | +2.1 | Reverted |
+| airport_runway variant A | combined + keep both | 244.0 | 0.0 | Reverted (neutral) |
+| airport_runway variant B | combined + drop runway | 244.7 | +0.7 | Reverted |
+| airport_runway variant C | combined + drop both | 244.0 | 0.0 | Reverted (neutral) |
+| airport_hour interaction | LFPG bias fix | 244.4 | +0.4 | Reverted |
+
+**Huber loss:** All alphas worse than MSE. The artifact filter already removed the extreme outliers that motivated Huber; without them, the remaining tail isn't heavy enough for Huber to outperform MSE.
+
+**airport_runway:** Model already captures the joint signal effectively via separate airport + runway features at their current importance levels. Combining them adds cardinality without new information.
+
+**airport_hour (LFPG fix):** LFPG diagnostic found hour-10 mean residual of +129s (3,136 flights) and a runway distribution shift (26R: 28.6% → 36.9%, 27R: 7.5% → 15.9% in validation). Despite this clear hour-level bias, the airport_hour feature didn't help — the hour pattern at CDG itself shifted between training and validation periods, so the model can't generalise it. The LFPG bias appears to be a train/val distribution shift problem, not a missing feature problem.
+
+**Conclusion:** 244.0s appears to be the ceiling for this feature set and data. The remaining error is driven by genuinely unpredictable events (LIRF disruption days) and structural distribution shifts between training and validation periods at CDG and EGLL.
 
 ---
 
@@ -359,3 +452,468 @@ Why this was the last thing tried rather than the first is worth noting: the ear
 With artifact rows removed, validation RMSE is 244.0s. The non-LIRF airports were already at 242.6s after v6 — so LIRF's genuine disruption days (not artifacts) account for most of the remaining gap. Those events are partially addressed by the day_deviation_ratio signal but cannot be fully predicted: they are low-frequency, high-severity events where no available feature signals the extreme before it begins.
 
 The remaining model features explain the structural variation well. The unsolved error is concentrated in genuinely unpredictable operational chaos.
+
+---
+
+## v10 Attempt — Runway Groups + Disruption Prior — Reverted
+
+**RMSE: 247.7s (+3.7s vs v9 244.0s baseline) — No improvement, reverted**
+
+Two new features were tested simultaneously:
+
+- `runway_group`: mapped each (airport, runway) pair to a physical operational group for LFPG/LIRF/EGLL/EDDF/EDDM (e.g. LFPG_north, LFPG_south) to pool same-complex runways and reduce sensitivity to seasonal runway distribution shifts. Ended up as the second-highest importance feature at 17.0% (gain), surpassing `stand` — but still produced worse RMSE overall.
+- `airport_month_disruption_rate`: P(disruption | airport, month) from training data — historical fraction of days per airport × month where daily mean taxi time exceeded 1.5× the airport baseline. Only 1.0% feature importance, suggesting it added little signal.
+
+Per-airport RMSE (validation):
+| Airport | RMSE (s) | Mean residual | n |
+|---|---|---|---|
+| LFPG | 321.8 | +28.0 | 41,579 |
+| LIRF | 371.0 | −28.9 | 25,306 |
+| EGLL | 293.0 | +9.1 | 42,558 |
+| EDDF | 204.6 | +2.2 | 38,351 |
+| EDDM | 230.1 | +6.3 | 26,682 |
+
+Top 5 feature importances (gain):
+| Feature | Importance |
+|---|---|
+| congestion_signal | 18.8% |
+| runway_group | 17.0% |
+| stand | 13.8% |
+| arvt_update_sec | 11.7% |
+| gate_delay_sec | 11.2% |
+
+The runway_group feature captured a real structural signal (high gain importance) but the overall RMSE worsened by 3.7s. Likely explanation: pooling runways within a complex reduces the cardinality/coverage problem for minority runways in validation but simultaneously loses the fine-grained distinction that the raw runway feature provided for the majority of flights. The net effect was negative. The disruption prior was essentially inert (1.0% importance), confirming the day_deviation_ratio signal already captures most of the same information dynamically on the day itself.
+
+---
+
+## Time-Decayed Sample Weights — Reverted
+
+**All half-lives worse than baseline. No improvement. No changes to model.py.**
+
+Hypothesis: the LFPG/EGLL RMSE is partly caused by a seasonal runway distribution shift between the training period (Jan–Oct 2025) and the validation period (Nov–Dec 2025). Weighting more recent training rows higher (exponential decay over `MVT_TIME_UTC_mvt`) would pull learned runway constants toward Sep–Oct data, which is closer to the validation distribution.
+
+Sweep results (LightGBM training with `lgb.Dataset(weight=...)` using `exp(-log(2)/half_life * age_days)`):
+
+| half_life | RMSE (s) | delta vs 244.0s |
+|---|---|---|
+| None (uniform) | 244.0 | 0.0 — BEST |
+| 270 days | 245.4 | +1.4 |
+| 180 days | 246.0 | +2.0 |
+| 90 days | 248.2 | +4.2 |
+| 60 days | 250.1 | +6.1 |
+
+The degradation is monotonic — shorter half-lives are strictly worse. Uniform weighting wins.
+
+Root cause diagnosis: LightGBM already learns seasonal patterns through the `month` categorical feature. Time-decayed weights simply reduce the effective training set size without providing new information the model couldn't already learn from feature interactions. The LFPG runway shift is a genuine distribution shift that no amount of reweighting can fully bridge, because the validation runway proportions are materially different from any subset of training months.
+
+**Conclusion:** The 244.0s baseline is the ceiling for this feature set and training setup. All attempted improvements — Huber loss, airport_runway combined feature, airport_hour interaction, config-agnostic runway groups, disruption prior, and time-decayed sample weights — failed to improve on it. The remaining error is driven by irreducible factors: genuine operational chaos (LIRF/LFPG disruption days) and structural distribution shifts between training and validation periods that available features cannot compensate for.
+
+---
+
+## v10 — Congestion Acceleration Added
+
+**Validation RMSE: 243.5s (−0.5s vs v9 244.0s baseline) — KEPT**
+
+New feature `congestion_acceleration = congestion_30min − congestion_60min`. A positive value means the 30-min mean is worse than the 60-min mean — congestion is worsening. A negative value means it is easing. Captures the *direction of trend* in airport congestion, which the rolling mean alone cannot encode.
+
+| Metric | Baseline (v9) | v10 | Delta |
+|---|---|---|---|
+| Overall RMSE | 244.0s | 243.5s | **−0.5s** |
+| December RMSE | 251.3s | 250.2s | −1.1s |
+| LFPG RMSE | ~311s | 313.0s | slight noise |
+| LIRF RMSE | ~371s | 369.1s | −1.9s |
+| EGLL RMSE | ~282s | 281.5s | −0.5s |
+| Worst-5% SSE | 61.0% | 61.0% | unchanged |
+
+Feature importance (gain): **0.7%** — small but consistent.
+
+Coverage: 99.3% of training rows. The ~0.7% NaN rows are earliest-of-day flights at each airport where the short window also has no completed predecessors; LightGBM handles NaN natively.
+
+Implementation: `CONGESTION_WINDOW_SHORT_MINUTES = 30` constant added. Two calls to `compute_congestion_signal()` in `main()` and `write_submission()`. `build_features()` signature updated to accept `congestion_acceleration` as a fourth argument.
+
+**Updated in v11:** short window tuned down to 10 min (see below).
+
+---
+
+## v11 — Congestion Acceleration Window Tuned to 10 min
+
+**Validation RMSE: 242.7s (−1.3s vs v9 244.0s baseline, −0.8s vs v10) — KEPT**
+
+Swept short window sizes for `congestion_acceleration = congestion_N − congestion_60`. Also tested stacking multiple windows simultaneously ("consensus"). All signals computed once; split shared across all runs.
+
+| Configuration | RMSE | vs v9 244.0s |
+|---|---|---|
+| accel = 10-min − 60-min | **242.7s** | **−1.3s** |
+| accel = 15-min − 60-min | 243.0s | −1.0s |
+| v10 + 20-min stacked | 243.1s | −0.9s |
+| v10 + 15-min stacked | 243.1s | −0.9s |
+| v10 + 10-min stacked | 243.1s | −0.9s |
+| v10 (accel = 30-min − 60-min) | 243.5s | −0.5s |
+| All 5 windows stacked | 243.3s | −0.7s |
+| accel = 45-min − 60-min | 244.3s | +0.3s |
+
+**Shorter windows win**: the 10-min window is the most reactive to developing congestion and produces the strongest leading signal. The 45-min window is too close to the 60-min base to provide useful directional information.
+
+**Stacking adds noise**: the full consensus model (all 5 windows) at 243.3s is worse than using 10-min alone at 242.7s. Extra windows are correlated with the best one; in LightGBM trees they compete for the same splits without adding independent signal.
+
+`CONGESTION_WINDOW_SHORT_MINUTES` updated from 30 → 10. `SUBMISSION_VERSION` incremented to 11.
+
+---
+
+## v12 — Stand Prefix Added
+
+**Validation RMSE: 241.4s (−1.3s vs v11 242.7s, −2.6s vs v9 244.0s baseline) — KEPT**
+
+New feature `stand_prefix`: first character of `STAND_mvt`, filled to `"UNK"` when missing. Added to `CATEGORICAL_FEATURES`. 4.66% gain importance.
+
+Stand prefix encodes which terminal complex or concourse a flight departs from. At every airport the per-prefix taxi time spread is large and physically motivated:
+
+| Airport | Best prefix | Mean | Worst prefix | Mean | Spread |
+|---|---|---|---|---|---|
+| LIRF | 2 | 969s | 9 | 1745s | 776s |
+| EGLL | 2 | 1221s | 5 | 1441s | 220s |
+| LFPG | X | 755s | K | 1172s | 417s |
+| EDDF | V | 785s | K | 1146s | 361s |
+| LSZH | F | 424s | T | 918s | 494s |
+
+All airports have 0% NaN on `STAND_mvt`.
+
+Why prefix adds something beyond the full `stand` categorical: with 409 unique stands at LFPG and `min_data_in_leaf=50`, sparse stands are regularised toward the global mean rather than their terminal-complex mean. Prefix gives those thin stands a better prior — "this stand I haven't seen much is in the K-complex, so expect +153s above average." LFPG improved by 3.4s (311.5s → 308.1s), confirming this hypothesis.
+
+1-char and 2-char prefix tested — identical RMSE (241.41s). 1-char kept for simplicity.
+
+---
+
+## Shortlist Experiments — Hour Categorical and MIN_DAY_FLIGHTS=3 — Both Reverted
+
+Both tested on the v12 baseline (241.41s). Both worse.
+
+| Experiment | RMSE | Delta |
+|---|---|---|
+| hour → categorical | 242.01s | +0.60s |
+| MIN_DAY_FLIGHTS = 3 | 241.80s | +0.39s |
+| Both together | 242.18s | +0.77s |
+
+**Hour as categorical**: making `hour` categorical forces LightGBM to treat each of 24 hours as independent buckets. Hours 00–03 have tiny row counts — leaf estimates become high-variance. The numeric form already gets clean threshold splits and works better.
+
+**MIN_DAY_FLIGHTS = 3**: 10,806 extra rows gain coverage but with noisy early-morning ratio values (only 3 completed flights, high variance). Degraded signal quality on those rows outweighs the earlier coverage benefit. MIN_DAY_FLIGHTS stays at 5.
+
+---
+
+## is_holiday_window — Reverted
+
+**RMSE: 244.2s (+0.2s vs baseline) — No improvement, reverted**
+
+Binary feature flagging Nov 20–30, Dec 18–31, and Jan 1–5 (peak European holiday travel periods). 133,048 / 354,447 validation rows flagged (37.5% coverage).
+
+| Metric | Baseline | With feature | Delta |
+|---|---|---|---|
+| Overall RMSE | 244.0s | 244.2s | +0.2s |
+| December RMSE | 251.3s | 251.7s | +0.4s |
+| LFPG RMSE | ~311s | 312.4s | +1.4s |
+| LIRF RMSE | ~371s | 371.5s | +0.5s |
+| EGLL RMSE | ~282s | 282.6s | +0.6s |
+| Worst-5% SSE share | 61.0% | 60.9% | −0.1% |
+
+Feature importance (gain): **0.0%** — the model assigned it no predictive weight.
+
+Root cause: the `month` categorical already encodes December as a distinct bucket. The holiday window is entirely redundant with `month=12` — it subdivides December into holiday vs. non-holiday days, but the model found no additional signal in that subdivision beyond what the month feature already provided. The worst-day disruptions (Nov 22 LFPG, Dec 7 LTFM, Dec 31 EGLL) are operational events that happen to fall in winter, not events *caused* by the holiday calendar that a static binary flag can predict.
+
+---
+
+## Two-Stage Regime Architecture — Not Adopted
+
+**Overall RMSE: 245.1s (+1.1s vs 244.0s baseline). Worst-5% SSE contribution increased from 61.0% → 63.5%. No changes to model.py.**
+
+Architecture tested:
+1. **Classifier**: LightGBM binary classifier predicting `is_disruption = (TAXITIME_SEC_mvt > per-airport p90)`. Trained on all 13 features. p90 thresholds computed on training split only.
+2. **Model A**: Regressor trained exclusively on non-disruption rows (90% of training data, ~1.56M rows).
+3. **Model B**: Regressor trained exclusively on disruption rows (10% of training data, ~173k rows).
+4. **Blend**: `pred = (1 − prob) × pred_A + prob × pred_B`
+
+Key diagnostic: `prob_disruption` mean on validation = **0.094**, p90 = 0.305. The classifier correctly identified low disruption probability for most flights, meaning the blend was effectively 94% Model A + 6% Model B for the average flight.
+
+Why it failed:
+- **Model A is weaker than the single model**: trained on 90% of the data, it lacks exposure to disruption-day context that helps it generalise even for normal flights.
+- **The blend dilutes both models**: for normal flights, adding 6% of Model B's chaos-skewed predictions introduces noise. The worst-5% SSE share went up 2.5pp, confirming the tail got worse.
+- **The classifier can't reliably route flights**: the features that would identify a true disruption flight (congestion_signal, day_deviation_ratio) are already in the single model. The classifier learns the same signal and the explicit routing step adds overhead without adding information.
+- **The single model already performs implicit regime detection**: through its tree splits on congestion_signal and day_deviation_ratio, it already captures the two-regime structure without explicit separation.
+
+| Metric | Single model | Two-stage blend | Delta |
+|---|---|---|---|
+| Overall RMSE | 244.0s | 245.1s | +1.1s |
+| December RMSE | 251.3s | 253.1s | +1.8s |
+| LFPG RMSE | ~311s | 317.2s | worse |
+| LIRF RMSE | ~371s | 376.8s | worse |
+| EGLL RMSE | ~282s | 282.5s | flat |
+| Worst-5% SSE | 61.0% | 63.5% | worse |
+
+---
+
+## v13 — Learning Rate + Rounds Retuned
+
+**Validation RMSE: 240.4s (−1.0s vs v12 241.4s) — KEPT**
+
+The hyperparameter grid search was last run at 384s with ~6 features. With 15 features and the artifact-filtered dataset, the optimal num_boost_round was much higher. Swept LR × rounds:
+
+| Config | RMSE | Delta |
+|---|---|---|
+| 0.05 / 500 (v12 baseline) | 241.41s | — |
+| 0.04 / 700 | 241.87s | +0.47s |
+| 0.03 / 1000 | 241.29s | −0.11s |
+| 0.02 / 1500 | 241.02s | −0.38s |
+| 0.02 / 2000 | 240.75s | −0.66s |
+| 0.02 / 2500 | 240.48s | −0.93s |
+| **0.02 / 3000** | **240.40s** | **−1.01s** |
+| 0.015 / 3000 | 240.63s | −0.78s |
+| 0.015 / 4000 | 240.48s | −0.93s |
+
+The trend plateaus between 2500–3000 rounds at LR=0.02. Going lower (0.015) with more rounds converges to the same region, confirming LR=0.02 / 3000 is near the optimum.
+
+`learning_rate` updated 0.05 → 0.02. `num_boost_round` updated 500 → 3000. No other changes.
+
+**Key insight:** Hyperparameters should be re-validated after major feature additions. The 500-round cap was appropriate for 6 features at 384s, but was leaving signal on the table with 15 features.
+
+---
+
+## Hyperparameter Sweep — num_leaves, Bagging, Regularization — All Reverted
+
+**All configs worse than v13 baseline (240.40s). No changes to model.py.**
+
+Tested against v13 (LR=0.02, rounds=3000, num_leaves=127, lambda=0.1, no bagging):
+
+| Config | RMSE | Delta |
+|---|---|---|
+| num_leaves=191 | 240.64s | +0.24s |
+| num_leaves=255 | 240.73s | +0.33s |
+| bagging_fraction=0.9, freq=5 | 241.07s | +0.67s |
+| bagging_fraction=0.8, freq=5 | 242.10s | +1.70s |
+| lambda_l1=lambda_l2=0.01 | 240.51s | +0.11s |
+| lambda_l1=lambda_l2=0.0 | 240.49s | +0.09s |
+
+- **More leaves**: deeper trees overfit — the 127-leaf model already extracts all the signal available
+- **Bagging**: reduces effective training data significantly; 3000 rounds needs all rows to converge well
+- **Less regularisation**: essentially flat — lambda=0.1 is already well-calibrated for this feature set
+
+**Conclusion:** 240.4s (v13) is the model ceiling. All hyperparameter axes exhausted. Feature space was exhausted in earlier experiments. The remaining 0.4s gap to 1st place (240.0s) is irreducible with the current architecture and dataset.
+
+---
+
+## v14 — 9-Seed Ensemble
+
+**Validation RMSE: 238.0s (−2.4s vs v13 240.4s) — KEPT**
+
+Multi-seed LightGBM ensemble using `feature_fraction=0.8` to introduce per-seed diversity. Swept ensemble sizes from 1 to 10 seeds.
+
+| Seeds | RMSE | Delta vs v13 |
+|---|---|---|
+| 1 (baseline, ff=0.8) | 238.95s | −1.45s |
+| 2 | 238.31s | −2.09s |
+| 3 | 238.14s | −2.26s |
+| 4 | 238.13s | −2.27s |
+| 5 | 238.06s | −2.34s |
+| 6 | 238.04s | −2.36s |
+| 7 | 237.99s | −2.41s |
+| **8–9** | **237.98s** | **−2.42s** |
+| 10 | 238.01s | −2.39s |
+
+9 seeds optimal. Returns from additional seeds plateau after 8–9.
+
+`ENSEMBLE_SEEDS = [42, 123, 456, 789, 1337, 2024, 31337, 99999, 7777]`
+`FEATURE_FRACTION = 0.8` (from 1.0)
+
+Note: `feature_fraction < 1.0` is what makes seeds produce diverse models. Without it, all seeds train the same tree structure and averaging provides no benefit.
+
+**Important caveat:** The 238.0s validation RMSE uses training data where `BLOCK_TIME_UTC_mvt` is available. See the BLOCK_TIME bug section below — this validation signal is not fully representative of ranking performance.
+
+---
+
+## Critical Bug: BLOCK_TIME_UTC_mvt Is Withheld in Ranking Data
+
+**Root cause of v9 (624.9s) and v13 (624.2s) scoring ~2.6× worse than validation.**
+
+`BLOCK_TIME_UTC_mvt` is fully NaN for all DEP rows in `ranking.parquet`. It is withheld by the competition organisers because it is derived from the target being predicted: `TAXITIME_SEC_mvt = MVT_TIME - BLOCK_TIME` by definition. Providing it would be a direct data leak.
+
+This means `schedule_delay_sec = BLOCK_TIME_UTC_mvt - SCHED_TIME_UTC_mvt` — our second-most-important feature, worth −22.9s — was NaN for every single ranking prediction. LightGBM's NaN branch paths for `schedule_delay_sec` were trained on the tiny minority of training rows where BLOCK_TIME happened to be missing (~0%), and those paths are not representative of typical flights. Every prediction used the wrong tree branch.
+
+Our validation RMSE (238–244s) was a false signal: validation data is drawn from the training set, where BLOCK_TIME is fully available.
+
+### Fix: AOBT_3_flt as substitute
+
+`AOBT_3_flt` (actual off-block time from the flight plan system, as opposed to surveillance) measures the same event. In training data:
+
+- Correlation with BLOCK_TIME: **r = 0.985**
+- Mean difference: ~17s (BLOCK_TIME tends to be slightly later)
+- Coverage in ranking DEP rows: **98.5%** (vs 0% for BLOCK_TIME)
+
+Fix applied to `build_features()`:
+
+```python
+# BLOCK_TIME_UTC_mvt is withheld in the ranking set (it is derived from the
+# target being predicted). AOBT_3_flt measures the same event from the flight
+# plan system (r=0.985) and serves as a substitute when BLOCK_TIME is absent.
+# Training data always has BLOCK_TIME, so training uses the cleaner signal;
+# ranking predictions fall through to AOBT_3_flt.
+out["schedule_delay_sec"] = (
+    df["BLOCK_TIME_UTC_mvt"].fillna(df["AOBT_3_flt"]) - df["SCHED_TIME_UTC_mvt"]
+).dt.total_seconds()
+```
+
+v14 submission used this fix for ranking predictions but the final models were still trained on BLOCK_TIME values (the fix was applied after the final ensemble finished training). A proper v15 retrain with AOBT_3 used consistently in both train and ranking prediction is needed for full consistency.
+
+---
+
+## Validation vs. Official Score Gap
+
+**We are experiencing a persistent, large delta between our local validation RMSE (~238–244s) and the official leaderboard RMSE (~573s).**
+
+### Submission history
+
+| Version | Validation RMSE | Official score | Notes |
+|---|---|---|---|
+| v9 | 244.0s | ~624s | BLOCK_TIME bug — `schedule_delay_sec` NaN for all ranking rows |
+| v13 | 240.4s | 624.2s | Same BLOCK_TIME bug |
+| v14 | 238.0s | ~624s | Fix applied to ranking predictions only; models trained before fix took effect |
+| v15 | 238.0s | 573.8s | Full retrain with AOBT_3 substitute; no artifact override |
+| v16 | ~257s | 573.8s | Artifact override (8 LIRF rows) added; but model degraded by fillna inversion bug |
+| v17 | ~238s (expected) | pending | Correct fillna order (`BLOCK_TIME.fillna(AOBT_3)`); artifact override kept |
+
+### Sources of the gap
+
+**1. BLOCK_TIME feature mismatch (fixed in v15)**
+
+Validation always uses training data where `BLOCK_TIME_UTC_mvt` is 100% available. Ranking data has it fully withheld. Before v15, this single missing feature caused `schedule_delay_sec` to be NaN for every ranking prediction, pushing all rows down the NaN tree branch — which was trained on essentially zero training examples. This explains the jump from ~624s to ~573s.
+
+**2. Artifact rows in ranking ground truth (partially fixed in v16+)**
+
+The date-rollover tracking artifacts documented in the LIRF deep dive also appear in the ranking period (Jan–Sep 2026). The ground-truth `TAXITIME_SEC_mvt` for those rows is approximately 86,400s (one day off). Our model predicts a reasonable value (~900s), creating an error of ~85,500s per row.
+
+Back-of-envelope estimate: assuming RMSE on non-artifact rows would be ~238s, we can solve for the number of artifact rows K that would explain an overall RMSE of 573.8s on 344,841 rows:
+
+```
+573.8² × 344,841 = 238² × (344,841 − K) + 85,500² × K
+1.136e11 = 1.953e10 + K × (7.309e9 − 56,644)
+K ≈ 13
+```
+
+Approximately 13 artifact rows in the ranking ground truth would fully explain the 573s score if the rest of the model were performing at 238s. We are currently overriding 8 LIRF rows (7 midnight-crossover + 1 AOBT date-error). If ~5 additional artifact rows exist that we have not identified, they would each contribute ~7.3 × 10⁹ to the SSE and keep the score well above 400s regardless of model quality.
+
+**3. fillna inversion bug in v16 (fixed in v17)**
+
+In v16, `schedule_delay_sec` was built with `AOBT_3.fillna(BLOCK_TIME)` instead of `BLOCK_TIME.fillna(AOBT_3)`. In training data, AOBT_3 and BLOCK_TIME are both present, but AOBT_3 has a mean absolute difference of ~384s from BLOCK_TIME — it is noisier. Training on the noisier signal degraded seed 2 validation RMSE from ~238s to 257.8s. The artifact fix in v16 was cancelled by this degradation. v17 reverts to `BLOCK_TIME.fillna(AOBT_3)` so training uses the clean BLOCK_TIME signal and AOBT_3 is only invoked for ranking predictions where BLOCK_TIME is absent.
+
+### Why validation RMSE is not a reliable signal for ranking performance
+
+Our validation set is drawn from Nov–Dec 2025 training data. In that set:
+- `BLOCK_TIME_UTC_mvt` is 100% available → `schedule_delay_sec` is always computed correctly
+- Artifact rows were filtered out of validation when they were filtered from training
+
+The ranking data (Jan–Sep 2026) has both issues present. Until we can confirm that our artifact override covers all artifact rows in the ranking ground truth, the official score will continue to diverge from validation RMSE regardless of model improvements.
+
+### What v17 should tell us
+
+If v17 scores near 573s again: the ~13 estimated artifact rows are still present and unhandled. We need to find the remaining ~5 rows our current override logic is missing.
+
+If v17 scores materially lower (e.g. 400–450s): the model quality fix (fillna order) is showing through, and the artifact problem is smaller than estimated.
+
+If v17 scores near 238s: our 8-row override was sufficient and the gap was almost entirely the model degradation from v16.
+
+## Score Gap Root-Cause Investigation (congestion train/serve skew)
+
+A fresh audit of `model.py` against the ranking data found the dominant driver of
+the 238s → 573s gap. It is **not** primarily the artifact rows hypothesized above.
+It is a **train/serve feature skew** in the congestion features, which are the model's
+most important inputs. The submission mechanics themselves are clean (see "Ruled out"
+below), so the gap is a model-quality problem, not a submission bug.
+
+Note the grader RMSE (573s) is *worse* than a constant-mean predictor (target
+std ≈ 546s). A model that is worse than the mean on the test set is the signature of
+a feature that is actively misleading at serving time, not merely uninformative.
+
+### Primary cause — `congestion_signal` measures a different quantity at serving
+
+`congestion_signal` is the **#1 feature by gain** (≈18% ahead of #2 `runway`). It is
+computed from a different data pool in training vs. serving:
+
+| | Training / validation | Ranking (graded) |
+|---|---|---|
+| median | 929s | 535s |
+| mean | 974s | 544s |
+| fed by | recent **taxi-OUT** of DEP rows | recent **taxi-IN** of ARR rows |
+
+- In `main()` the completed pool passed to `compute_congestion_signal` is `df` itself
+  (DEP taxi-out times).
+- In `write_submission()` the pool is `train_df` + `arr_context`. The ranking period is
+  **2026-01 → 2026-07, entirely after training (all of 2025), with zero overlap**. So
+  the 2025 training departures fall outside every 60-min rolling window in the 2026
+  ranking period, and the signal is fed **almost entirely by ARR taxi-IN times**
+  (mapped `ADES → ADEP`). Taxi-in is a systematically smaller, decorrelated quantity.
+
+The model learned "congestion ≈ 930 ⇒ predict ≈ 900s taxi." At grading it reads ≈ 535
+and interprets it as low congestion, biasing predictions low and destroying accuracy.
+This is inherent: at serving you cannot know recent taxi-*out* of the ranking period —
+those are exactly the withheld targets. `congestion_acceleration` (short − long window)
+and `day_deviation_ratio` (numerator = today's flights, baseline = per-airport mean over
+the pool) inherit the same skew.
+
+### Secondary cause — `schedule_delay_sec` trains on a serving-absent column
+
+`schedule_delay_sec` uses `BLOCK_TIME_UTC_mvt.fillna(AOBT_3_flt)`. `BLOCK_TIME` is 100%
+present in training but 100% null in ranking, so training learns on `BLOCK_TIME − SCHED`
+while grading silently substitutes `AOBT_3 − SCHED`. Correlation with the target shifts
+(0.016 → 0.104) and the feature distribution moves. This is the same issue flagged in the
+"BLOCK_TIME feature mismatch" note above, but note the current `.fillna()` order does not
+fix it — it *hides* it: training never touches the fallback branch, so the model is still
+tuned on a column it will never see at serving.
+
+### Quantified impact (single-seed, lr=0.05, 400 rounds — a lighter model than the 9×3000 ensemble)
+
+| Scenario (evaluated on the same val fold) | RMSE |
+|---|---|
+| Baseline (features as computed in training) | 241.7s |
+| + `schedule_delay` recomputed with AOBT_3 (serving-style) | 295.3s |
+| + congestion crudely rescaled to taxi-in scale (×535/929) | 320.4s |
+
+The 320s is a **conservative floor**: the crude rescale keeps the feature's correlation
+structure, whereas the real served signal is decorrelated taxi-in noise. The production
+ensemble (lr=0.02, 3000 rounds) over-fits the skewed congestion feature harder, widening
+the gap further. Temporal shift (6-month-later, spring/summer period) compounds on top.
+
+### Fixes (priority order)
+
+1. **Congestion pool consistency (primary).** Compute the congestion pool identically in
+   training and serving. Either (a) build the training congestion from the same ARR
+   taxi-in context that serving will use (honest but weaker signal), or better (b) replace
+   the mean-taxi-time congestion with a **demand/queue-count** signal (number of
+   departures in the preceding window), which is available and identically scaled at both
+   train and serve time. Apply the same treatment to `congestion_acceleration` and
+   `day_deviation_ratio`.
+2. **Drop the `BLOCK_TIME` branch (secondary).** Use `AOBT_3_flt − SCHED_TIME` in *both*
+   training and ranking so the model trains on the column it will actually be served.
+   Never feed a training-only column.
+3. **Make validation mirror the grader.** In `time_based_split`, compute all time-window
+   features for the val fold using only the pool that would exist at serving for that fold
+   (prior periods + ARR taxi-in), exactly as `write_submission` builds it. Also fix the
+   `day_deviation` per-airport baseline, which is currently a global mean over all 12
+   months (leaks the val period into val features). Until validation is computed this way,
+   local RMSE cannot track the grader.
+4. **Re-clip after the LIRF override.** The LIRF override writes `proxy_taxi` (can be
+   negative) *after* the `np.clip(..., 0, None)`, reintroducing negatives. Re-clip.
+
+### Ruled out (checked, clean)
+
+- **Units/transformation:** predictions are plain seconds, no log — v17 median 874s vs
+  training 912s.
+- **ID/row alignment:** template ↔ ranking DEP is a perfect 1:1 map, no dupes, mapped by
+  `MVT_ID` not position.
+- **Outlier filtering:** the `TAXITIME ≤ 21600` filter drops only 69 of 2.08M rows
+  (0.003%). Not a factor.
+- **Submission NaN/defaults:** v17 has 0 nulls; every ranking DEP row is covered.
+
+### Note on the earlier artifact hypothesis
+
+The "K ≈ 13 artifact rows" math above assumes non-artifact RMSE is ≈ 238s and solves for
+the artifact count needed to reach 573s. This investigation shows the non-artifact RMSE is
+itself well above 238s at serving (the congestion feature is degraded for *every* row), so
+the gap is explained by model quality across all rows, not a handful of outliers. The
+artifact override is still worth keeping, but it is not the main lever.
