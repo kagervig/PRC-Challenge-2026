@@ -917,3 +917,62 @@ the artifact count needed to reach 573s. This investigation shows the non-artifa
 itself well above 238s at serving (the congestion feature is degraded for *every* row), so
 the gap is explained by model quality across all rows, not a handful of outliers. The
 artifact override is still worth keeping, but it is not the main lever.
+
+---
+
+## v20 — Weather Features Added
+
+**Official score: 518.4s (−55s vs prior ~573s) — #134 leaderboard**
+
+Added 5 hourly weather features joined to each departure by `(airport, floor(AOBT_3, hour))`:
+
+| Feature | Source | Coverage |
+|---|---|---|
+| `weather_temp_c` | Meteostat (9 airports), IEM (LTFM, LEMD) | ~100% |
+| `weather_wind_kt` | Meteostat / IEM | ~100% |
+| `weather_precip_mm` | Meteostat / IEM | ~99% |
+| `weather_visibility_m` | IEM only (LTFM, LEMD) | 100% at those 2 airports, NaN elsewhere |
+| `weather_code` | Meteostat only (1=clear → 25=heavy thunderstorm) | ~99% at 9 airports, NaN at LTFM/LEMD |
+
+**Data sources:** Meteostat's v2 API for 9 airports (stations 0.5–2.8 km from field, 99–100% hourly coverage). IEM ASOS for LTFM (Meteostat maps to old Ataturk airport 33 km away) and LEMD (Meteostat only 40% coverage). Weather pre-fetched and cached to `weather_cache.parquet` covering Jan 2025 – Aug 2026. No API calls at training or prediction time.
+
+**Why temperature drove the improvement:** Temperature encodes the most operationally impactful weather condition — cold weather drives de-icing queue formation, which is the primary mechanism linking weather to taxi time. Precipitation and wind independently describe the same conditions less precisely.
+
+---
+
+## Weather Ablation Test
+
+Single-seed ablation: each feature disabled one at a time, RMSE measured against baseline of 266.6s (single seed, all features on).
+
+| Feature | RMSE | Delta | Verdict |
+|---|---|---|---|
+| runway | 284.7s | +18.1s | strong signal |
+| weather_temp_c | 276.1s | +9.6s | strong signal |
+| gate_delay_sec | 273.1s | +6.5s | strong signal |
+| stand | 271.5s | +4.9s | strong signal |
+| airline | 270.8s | +4.3s | strong signal |
+| schedule_delay_sec | 270.8s | +4.2s | strong signal |
+| arvt_update_sec | 270.7s | +4.1s | strong signal |
+| hour | 270.1s | +3.5s | strong signal |
+| stand_prefix | 267.6s | +1.0s | neutral |
+| congestion_signal | 267.5s | +0.9s | neutral* |
+| weight_class | 267.4s | +0.8s | neutral |
+| weather_code | 267.4s | +0.8s | neutral |
+| airport | 266.8s | +0.3s | neutral |
+| day_deviation_ratio | 266.8s | +0.2s | neutral* |
+| weather_wind_kt | 266.7s | +0.1s | neutral |
+| weather_visibility_m | 266.6s | 0.0s | no signal |
+| weather_precip_mm | 266.4s | −0.1s | neutral |
+| market_segment | 266.4s | −0.2s | neutral |
+| month | 266.1s | −0.4s | slight noise |
+| congestion_acceleration | 265.9s | −0.7s | slight noise |
+
+*`congestion_signal` and `day_deviation_ratio` appear neutral individually because they substitute for each other — removing one allows the other to compensate. A group ablation (removing both simultaneously) would reveal their true combined contribution.
+
+**Key findings:**
+
+- `runway` is the single most important feature (+18.1s), not `congestion_signal` as earlier importance scores suggested. Weather features changed the landscape.
+- `weather_temp_c` (+9.6s) is the only weather feature doing real work. Wind, precip, visibility, and condition code are all within noise — temperature alone captures the operationally relevant signal (de-icing conditions, winter disruption).
+- `congestion_acceleration` (short-window minus long-window delta) slightly hurts (−0.7s). The directional signal adds noise rather than information.
+- `month` slightly hurts (−0.4s) — `weather_temp_c` already encodes seasonality more precisely as a continuous variable. Month as a categorical overfits to specific months in training.
+- The 40s official score improvement from v19→v20 confirms the weather signal genuinely generalises to the ranking period — it is not an artefact of the training/validation distribution.

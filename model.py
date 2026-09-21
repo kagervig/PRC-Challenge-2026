@@ -32,7 +32,7 @@ ENSEMBLE_SEEDS = [42, 123, 456, 789, 1337, 2024, 31337, 99999, 7777]
 
 FEATURES = {
     # identity / location
-    "airport":               True,
+    "airport":               False,
     "runway":                True,
     "stand":                 True,
     "stand_prefix":          True,
@@ -424,6 +424,9 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     result.to_parquet(out_path, index=False)
     print("version: ", version)
     print(f"Submission written to {out_path}")
+    for feature in FEATURES:
+        if feature == False:
+            print(feature, " set to FALSE")
     return out_path
 
 
