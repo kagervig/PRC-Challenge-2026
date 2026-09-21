@@ -24,7 +24,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 20
+SUBMISSION_VERSION = 21
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -32,31 +32,31 @@ ENSEMBLE_SEEDS = [42, 123, 456, 789, 1337, 2024, 31337, 99999, 7777]
 
 FEATURES = {
     # identity / location
-    "airport":               False,
+    "airport":               True,
     "runway":                True,
     "stand":                 True,
     "stand_prefix":          True,
     "airline":               True,
     "weight_class":          True,
-    "market_segment":        True,
+    "market_segment":        False,  # ablation: −0.2s, no signal
     # time
-    "month":                 True,
+    "month":                 False,  # ablation: −0.4s, seasonality covered by weather_temp_c
     "hour":                  True,
     # delay signals
     "gate_delay_sec":        True,
     "schedule_delay_sec":    True,
     # congestion signals
     "congestion_signal":     True,
-    "congestion_acceleration": True,
+    "congestion_acceleration": False, # ablation: −0.7s, adds noise
     "day_deviation_ratio":   True,
     # flight plan signal
     "arvt_update_sec":       True,
     # weather
     "weather_temp_c":        True,
-    "weather_wind_kt":       True,
-    "weather_precip_mm":     True,
-    "weather_visibility_m":  True,
-    "weather_code":          True,
+    "weather_wind_kt":       False,  # ablation: +0.1s, noise
+    "weather_precip_mm":     False,  # ablation: −0.1s, no signal
+    "weather_visibility_m":  False,  # ablation: 0.0s, NaN for 9/11 airports
+    "weather_code":          True,   # ablation: +0.8s, marginal but positive
 }
 
 _CATEGORICAL = {
