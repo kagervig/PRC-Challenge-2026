@@ -286,6 +286,12 @@ Baseline: 357.6s (v7 with arvt_update_sec)
 
 **WARNING: BLOCK_TIME - MVT_TIME and MVT_TIME - SCHED_TIME are data leakage** — MVT_TIME = BLOCK_TIME + TAXITIME by definition (r=-1.0 confirmed). Never use MVT_TIME as a feature.
 
+> **RECONSIDERED (2026-09-22):** This blanket ban was reversed in v22. `MVT_TIME` is
+> actually *present in the ranking set* (only `BLOCK_TIME` is withheld), so
+> `proxy_taxi = MVT_TIME − AOBT_3` is a legitimately-available feature: on clean rows
+> it's a sharp taxi estimate, and on date-rollover artifacts it equals the corrupted
+> label. It's target-adjacent, not unusable leakage. See "Leaderboard Reconciliation".
+
 ---
 
 ## v7 — ARVT Update + Day Deviation
@@ -820,6 +826,13 @@ If v17 scores near 238s: our 8-row override was sufficient and the gap was almos
 
 ## Score Gap Root-Cause Investigation (congestion train/serve skew)
 
+> **CORRECTION (2026-09-22): this section's headline conclusion was wrong.** The
+> congestion skew below is a *real bug worth fixing*, but it is **not** the dominant
+> driver of the leaderboard gap. Fixing it did not move the score on its own (v18 was
+> masked by a harmful override). The gap is dominated by **corrupted-label artifacts**
+> in the ranking ground truth — the hypothesis this section dismissed. See the
+> definitive write-up at the end of this file: "Leaderboard Reconciliation".
+
 A fresh audit of `model.py` against the ranking data found the dominant driver of
 the 238s → 573s gap. It is **not** primarily the artifact rows hypothesized above.
 It is a **train/serve feature skew** in the congestion features, which are the model's
@@ -976,3 +989,87 @@ Single-seed ablation: each feature disabled one at a time, RMSE measured against
 - `congestion_acceleration` (short-window minus long-window delta) slightly hurts (−0.7s). The directional signal adds noise rather than information.
 - `month` slightly hurts (−0.4s) — `weather_temp_c` already encodes seasonality more precisely as a continuous variable. Month as a categorical overfits to specific months in training.
 - The 40s official score improvement from v19→v20 confirms the weather signal genuinely generalises to the ranking period — it is not an artefact of the training/validation distribution.
+
+---
+
+## Leaderboard Reconciliation (2026-09-22) — why clean val ≠ leaderboard
+
+This is the definitive account of the ~250s-clean-val vs ~518s-leaderboard gap. Two
+earlier write-ups in this file overshot in opposite directions (congestion skew "is the
+root cause"; then "irreducible artifact ceiling"). Both are corrected here.
+
+### Leaderboard progression
+
+| Version | What changed | Official RMSE |
+|---|---|---|
+| v15 | no override; old skewed congestion + BLOCK_TIME schedule_delay | 573.8 (was best for a long time) |
+| v16–v18 | congestion/schedule fixes **+ a harmful override** | ≥ 573.8 (never beat it) |
+| v19 | harmful override removed; only `proxy_taxi > 50000` (1 row) kept | **531** |
+| v20 | weather features integrated | **518** |
+| v22 | `proxy_taxi` feature + honest validation | pending |
+
+### The two things that were fighting each other
+
+1. **The congestion train/serve skew and the `schedule_delay` BLOCK_TIME dependency were
+   real bugs** that hurt genuine generalisation — worth fixing. (Documented above.)
+2. **v18 hid those gains** because it *also* carried a harmful override branch: it
+   force-predicted `proxy + 86400` (~87,000s) on LIRF flights matching an
+   AOBT-hour-23 / MVT-hour-0 pattern. Most such flights are **normal** near-midnight
+   departures, so the override injected ~86,400s errors on good rows — roughly cancelling
+   the fix gains. Removing that branch (v19) let the fixes surface → 531.
+
+**Lesson: the leaderboard responds to genuine model improvement (573.8 → 531 → 518). There
+is no "irreducible ceiling." But absolute clean-val (~250) will never equal the
+leaderboard, because the leaderboard is dominated by corrupted labels the clean val filters
+out.**
+
+### The artifacts, definitively
+
+Target is `TAXITIME = MVT_TIME − BLOCK_TIME`. An artifact is a row where one of those two
+timestamps has the wrong **calendar date** (a logging glitch), so the subtraction yields an
+impossible duration (~6–36 h). 69 such rows in 2025 training (66 LIRF, 2 LFPG, 1 LSZH); the
+ranking ground truth contains the same kind.
+
+Two flavours:
+- **Flavour B — MVT_TIME has the wrong day.** The corrupted timestamp is one we *can see*.
+  `proxy_taxi = MVT_TIME − AOBT_3` comes out ~86,400, and it matches the corrupted label.
+  **Detectable and recoverable** (this is the `proxy_taxi > 50000` override, ~40/69 in training).
+- **Flavour A — BLOCK_TIME has the wrong day.** `BLOCK_TIME` is 100% withheld in the ranking
+  set, and every *visible* timestamp agrees, so there is no outlier to detect.
+  **Undetectable** (~29/69).
+
+Why a "majority-vote over the 4 timestamps to snap the outlier date" idea does **not** work:
+on artifact rows the corroborating columns (`EOBT`, `LOBT`, `IOBT`, `AOBT`) are almost all
+**null** — only 1 of 69 has ≥2 non-null reference votes. There is nothing to vote with.
+
+Why artifacts dominate the score: RMSE squares errors. One artifact row (label ~86,000, we
+predict ~900) contributes `85,000² ≈ 7.2e9` — **≈ 92,000 normal rows' worth of squared
+error**. In a local test, 8 artifact rows (0.002% of val) caused 47% of the SSE, and the
+honest per-month RMSE swings 275 (Oct, 1 artifact) → 617 (Jul, 17 artifacts) for the *same
+model*. The leaderboard number is therefore high-variance and driven by artifact *count*,
+not skill.
+
+### How teams reach < 250
+
+Almost certainly by **using `MVT_TIME` (via `proxy_taxi`)**: it sharpens clean rows *and*
+auto-matches the Flavour-B corrupted labels for free. This is why v22 adds `proxy_taxi` as a
+feature (reversing the old "never use MVT_TIME" ban) and keeps the explicit `proxy > 50000`
+override (trees can't extrapolate to 86,400 on their own). Flavour-A artifacts remain
+unrecoverable — a floor set by the organiser's data quality.
+
+### Honest validation (added v22)
+
+The old validation filtered `TAXITIME ≤ 21600` from *both* train and val, so it never saw the
+artifacts that dominate grading — reporting ~250 while the board sat at ~518. v22 fixes this:
+train on clean rows only, but **keep artifacts in the validation set and apply the same
+override**, reporting both `honest RMSE` (grader-style) and `clean-only`. Still single-fold
+(Nov–Dec, winter); `honest_val.py` holds a rolling-origin version that spans seasons and
+brackets the leaderboard (Apr–Jul honest ≈ 305–617, with 518 inside the range).
+
+**Takeaways for future work:**
+- Judge changes on the **honest** number, not clean-only.
+- Genuine model gains (features, weather) *do* move the board — keep pursuing them.
+- Do **not** re-add pattern-based overrides (e.g. midnight-crossover) that fire on normal
+  flights; only override physically-impossible `proxy_taxi > 50000`.
+- The remaining gap above clean skill is Flavour-A artifacts + 2026 seasonal shift, both
+  outside our control.
