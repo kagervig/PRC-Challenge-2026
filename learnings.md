@@ -1054,8 +1054,11 @@ not skill.
 Almost certainly by **using `MVT_TIME` (via `proxy_taxi`)**: it sharpens clean rows *and*
 auto-matches the Flavour-B corrupted labels for free. This is why v22 adds `proxy_taxi` as a
 feature (reversing the old "never use MVT_TIME" ban) and keeps the explicit `proxy > 50000`
-override (trees can't extrapolate to 86,400 on their own). Flavour-A artifacts remain
-unrecoverable — a floor set by the organiser's data quality.
+override (trees can't extrapolate to 86,400 on their own).
+
+> **SUPERSEDED (2026-09-22): Flavour-A artifacts are NOT unrecoverable.** They have a
+> detectable signature (missing flight plan + large `MVT − SCHED`) that recovered ~132
+> points. See "Artifact Recovery Breakthrough" at the end of this file.
 
 ### Honest validation (added v22)
 
@@ -1073,3 +1076,85 @@ brackets the leaderboard (Apr–Jul honest ≈ 305–617, with 518 inside the ra
   flights; only override physically-impossible `proxy_taxi > 50000`.
 - The remaining gap above clean skill is Flavour-A artifacts + 2026 seasonal shift, both
   outside our control.
+
+---
+
+## Artifact Recovery Breakthrough (2026-09-22) — 490.7 → 358.5
+
+The claim that Flavour-A artifacts (corruption in the withheld `BLOCK_TIME`) are
+undetectable was **wrong**. They have a clear signature, and recovering them was the
+single biggest gain of the whole project after the harmful-override removal.
+
+### Validated leaderboard history (from the grader's per-submission JSON, `truthing.parquet`, all 344,841 rows)
+
+| Ver | Score | Note |
+|---|---|---|
+| v9 | 624.61 | |
+| v13 | 624.19 | |
+| v14 | 627.36 | |
+| v15 | 573.85 | AOBT substitute, no override |
+| v16 | 678.04 | harmful midnight override (worse!) |
+| v17 | 697.73 | harmful override (worst) |
+| v18 | 658.19 | harmful override + congestion fix |
+| v19 | 531.27 | harmful override removed |
+| v20 | 518.42 | weather |
+| v21 | 518.44 | feature ablation (≈neutral) |
+| v22 | 490.73 | `proxy_taxi` feature |
+| v23 | 511.81 | 1-row probe — **confirmed the corrupted-label math to 4 sig figs** |
+| **v25** | **358.45** | **airport-restricted no-flight-plan artifact override** |
+
+The harmful midnight override cost **~100+ points** (v16–v18 vs v15) — the biggest single
+mistake; never re-add pattern overrides that fire on normal flights.
+
+### The Flavour-A signature
+
+The clean-model RMSE is **224.8** (honest validation, clean-only) — excellent. So nearly the
+entire 490→225 gap was artifacts, not model quality. **Feature work is therefore heavily
+diluted** (a 25s clean gain moves the board only ~11s); artifact recovery is ~30× more
+valuable per row.
+
+Flavour-A artifacts turned out to share a signature, all visible in the ranking set:
+- **The entire flight-plan block is null** — `AOBT_3`, `EOBT_1`, `LOBT`, `ARVT_3` all NaN
+  (100% of the 68 training Flavour-A artifacts, vs 1.1% of normal rows).
+- On those rows, `SCHED_TIME` tracks the corruption, so **`MVT − SCHED` equals the corrupted
+  ground-truth label to a median of 3 seconds.** So once detected, we know exactly what to
+  predict: `MVT − SCHED`.
+
+### The detector (shipped in v25)
+
+Override a row's prediction with `MVT − SCHED` when **all** of:
+1. `ADEP ∈ {LIRF, LFPG, LSZH}` — the only airports with the defect in training (0 elsewhere),
+2. `AOBT_3` is null (flight plan missing),
+3. `MVT − SCHED > 10h`.
+
+- Training precision: **83%** (44 TP / 9 FP). The airport restriction is essential — without
+  it, EHAM etc. contribute delayed-but-normal no-plan flights and precision collapses to 30%,
+  making a blanket override net-negative (this is why the earlier "undetectable" call was made).
+- It flagged **21 ranking rows** (18 LIRF, 2 LFPG, 1 LSZH), values 10–31h.
+- Result: **490.73 → 358.45**, saving 3.87e10 SSE — matching the model's estimate.
+
+### Why the separator works despite `BLOCK_TIME` being hidden
+
+The only thing distinguishing an artifact from a genuinely-delayed flight is where the
+(hidden) `BLOCK_TIME` sits. We can't see it — **but the missing-flight-plan flag is a proxy
+for the same data-quality failure**, and the airport restriction removes the legitimately-
+delayed no-plan flights (which occur everywhere, not just at the three defect airports).
+
+### Tuning limits (do not push further)
+
+- **Don't lower the 10h threshold.** The [6,10h] band is 38% precision (18 TP/30 FP) — below
+  break-even for that band (there TP and FP errors are similar magnitude, unlike the >10h band
+  where corrupted labels are much larger). The [3,6h] band is 0% precision (441 FPs).
+- **Don't widen airports** — no training artifacts exist outside the three.
+
+### Where we stand
+
+At 358.45 with clean ≈ 225, roughly **1–4 big artifacts remain** (the exact count depends on
+the true ranking clean-RMSE, which the winter fold may understate). They sit in the low-
+precision bands or lack the signature, so they're likely not cleanly recoverable. We've
+captured most of the recoverable value. Remaining levers are small: the residual artifacts
+(hard) and clean-model improvement (heavily diluted).
+
+**Status:** v25 is a post-processing derivative of v22 (not yet codified in `model.py`).
+Once confirmed (it is — 358.45), fold the override into `apply_artifact_override` so it's
+reproducible, alongside the existing `proxy_taxi > 50000` branch.

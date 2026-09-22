@@ -28,7 +28,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 22
+SUBMISSION_VERSION = 24
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -37,6 +37,7 @@ ENSEMBLE_SEEDS = [42, 123, 456, 789, 1337, 2024, 31337, 99999, 7777]
 FEATURES = {
     # identity / location
     "airport":               True,
+    "dest":                  True,   # ADES; destination shapes departure runway/direction (−2.3s clean val)
     "runway":                True,
     "stand":                 True,
     "stand_prefix":          True,
@@ -50,6 +51,8 @@ FEATURES = {
     "gate_delay_sec":        True,
     "schedule_delay_sec":    True,
     "proxy_taxi":            True,   # MVT_TIME - AOBT_3; target-adjacent, strongest single signal
+    "aobt_lobt_sec":         True,   # AOBT_3 - LOBT; off-block vs latest plan (−1.5s clean val)
+    "eobt_iobt_sec":         True,   # EOBT_1 - IOBT; replanning churn (−1.2s clean val)
     # congestion signals
     "congestion_signal":     True,
     "congestion_acceleration": False, # ablation: −0.7s, adds noise
@@ -65,7 +68,7 @@ FEATURES = {
 }
 
 _CATEGORICAL = {
-    "airport", "runway", "stand", "stand_prefix",
+    "airport", "dest", "runway", "stand", "stand_prefix",
     "airline", "weight_class", "market_segment", "month",
 }
 CATEGORICAL_FEATURES = [f for f in _CATEGORICAL if FEATURES.get(f, False)]
@@ -275,6 +278,7 @@ def build_features(
     F = FEATURES
     out = pd.DataFrame(index=df.index)
     if F["airport"]:        out["airport"]        = df["ADEP_mvt"].astype("category")
+    if F["dest"]:           out["dest"]           = df["ADES_mvt"].astype("category")
     if F["runway"]:         out["runway"]         = df["RUNWAY_mvt"].astype("category")
     if F["stand"]:          out["stand"]          = df["STAND_mvt"].astype("category")
     if F["airline"]:        out["airline"]        = df["AIRCRAFT_OPERATOR_flt"].astype("category")
@@ -299,6 +303,10 @@ def build_features(
         # avoided as target-adjacent — included deliberately now as the dominant
         # available signal (reverses the prior "never use MVT_TIME" stance).
         out["proxy_taxi"] = (df["MVT_TIME_UTC_mvt"] - df["AOBT_3_flt"]).dt.total_seconds()
+    if F["aobt_lobt_sec"]:
+        out["aobt_lobt_sec"] = (df["AOBT_3_flt"] - df["LOBT_flt"]).dt.total_seconds()
+    if F["eobt_iobt_sec"]:
+        out["eobt_iobt_sec"] = (df["EOBT_1_flt"] - df["IOBT_flt"]).dt.total_seconds()
     if F["congestion_signal"]:     out["congestion_signal"]     = congestion
     if F["congestion_acceleration"]: out["congestion_acceleration"] = congestion_acceleration
     if F["day_deviation_ratio"]:   out["day_deviation_ratio"]   = day_deviation
@@ -461,6 +469,7 @@ def main() -> None:
     if args.fast:
         print(f"FAST MODE: using {len(seeds)} seed (reduced accuracy)\n")
 
+    print("Version: ", SUBMISSION_VERSION)
     print("Loading training data...")
     movements = load_movements()
     # Keep the unfiltered departures: artifact rows are excluded from *training* but
