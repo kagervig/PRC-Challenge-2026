@@ -1350,6 +1350,12 @@ real board (313.00 → 310.08). Since `active_departures_queue` is the same clas
 shows a *positive* honest-val delta (−0.79/−0.91s), its true board gain is likely larger than
 the honest fold suggests — a strong case to actually submit v29, not just keep the code.
 
+**CONFIRMED — v29 board = 308.0 (−2.08s over v28).** Honest val predicted −0.79s; the board
+delivered ~−2s, the same ~2.5× under-estimate seen on v28. The calibration pattern now holds
+twice (n=2): **on congestion/disruption features, multiply the honest-val delta by ~2–3× to
+anticipate the board, and submit even small positive honest-val gains of this feature class.**
+Running board: v27 313.00 → v28 310.08 → **v29 308.0**.
+
 ### Why this worked where earlier queue attempts didn't
 
 - "Departure queue (±30 min EOBT count)": +2.1s — a symmetric window around *planned* off-block,

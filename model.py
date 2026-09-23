@@ -13,6 +13,7 @@ from sklearn.metrics import root_mean_squared_error
 
 CONGESTION_WINDOW_MINUTES = 60       # easy to tune
 CONGESTION_WINDOW_SHORT_MINUTES = 10 # short window for acceleration signal
+SCHEDULED_PUSH_DENSITY_WINDOW_MINUTES = 30 # ±window for scheduled departure density signal
 MIN_DAY_FLIGHTS = 5  # completed flights required before day_deviation_ratio fires
 # A date-rollover artifact records AOBT and MVT_TIME a full day apart; no genuine
 # taxi lasts this long, so proxy_taxi above this threshold flags the artifact.
@@ -35,11 +36,25 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 30
+SUBMISSION_VERSION = 31
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
 ENSEMBLE_SEEDS = [42, 123, 456, 789, 1337, 2024, 31337, 99999, 7777]
+
+AIRPORT_TIMEZONES = {
+    "EDDM": "Europe/Berlin",
+    "EDDF": "Europe/Berlin",
+    "EGLL": "Europe/London",
+    "EHAM": "Europe/Amsterdam",
+    "LEMD": "Europe/Madrid",
+    "LFPG": "Europe/Paris",
+    "LIRF": "Europe/Rome",
+    "LOWW": "Europe/Vienna",
+    "LPPT": "Europe/Lisbon",
+    "LSZH": "Europe/Zurich",
+    "LTFM": "Europe/Istanbul",
+}
 
 FEATURES = {
     # identity / location
@@ -54,6 +69,8 @@ FEATURES = {
     # time
     "month":                 False,  # ablation: −0.4s, seasonality covered by weather_temp_c
     "hour":                  True,
+    "local_hour_sin":        True,   # sin(2π × local_hour/24); cyclical local departure hour
+    "local_hour_cos":        True,   # cos(2π × local_hour/24); cyclical local departure hour
     # delay signals
     "gate_delay_sec":        True,
     "schedule_delay_sec":    True,
@@ -69,6 +86,7 @@ FEATURES = {
     "recent_delay":          True,   # mean AOBT-SCHED of recent departures (departure-side disruption)
     "arrival_demand":        True,   # # arrivals in preceding 60min (inbound surface pressure)
     "active_departures_queue": True, # departures pushed back but not yet airborne at pushback (queue length)
+    "hourly_scheduled_push_density": True, # count of SCHED_TIME departures at same airport ±30min of AOBT_3
     # flight plan signal
     "arvt_update_sec":       True,
     # weather
@@ -387,6 +405,41 @@ def compute_arrival_demand(
     return result
 
 
+def compute_scheduled_push_density(
+    departures: pd.DataFrame,
+    window_minutes: int = SCHEDULED_PUSH_DENSITY_WINDOW_MINUTES,
+) -> pd.Series:
+    """
+    For each departure, count same-airport departures whose SCHED_TIME_UTC_mvt
+    falls within ±window_minutes of AOBT_3_flt.
+
+    Measures how many flights were scheduled to depart in the same time window —
+    a planned traffic density signal that is available from the published schedule
+    at both training and serving time. Uses sorted SCHED_TIME and binary search
+    (same vectorised pattern as compute_arrival_demand).
+    """
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    window_s = window_minutes * 60.0
+    result = pd.Series(0.0, index=departures.index, dtype=float)
+
+    ref = departures["AOBT_3_flt"].fillna(departures["MVT_TIME_UTC_mvt"])
+    ref_s = (ref - epoch).dt.total_seconds()
+    sched_s = (departures["SCHED_TIME_UTC_mvt"] - epoch).dt.total_seconds()
+
+    for _, dep_group in departures.groupby("ADEP_mvt"):
+        idx = dep_group.index
+        valid_sched = sched_s.loc[idx].dropna()
+        if valid_sched.empty:
+            continue
+        sched_sorted = np.sort(valid_sched.values)
+        ref_vals = ref_s.loc[idx].values
+        hi = np.searchsorted(sched_sorted, ref_vals + window_s, side="right")
+        lo = np.searchsorted(sched_sorted, ref_vals - window_s, side="left")
+        result.loc[idx] = (hi - lo).astype(float)
+
+    return result
+
+
 # -- Feature engineering ------------------------------------------------------
 
 def build_features(
@@ -398,6 +451,7 @@ def build_features(
     recent_delay: pd.Series | None = None,
     arrival_demand: pd.Series | None = None,
     active_departures_queue: pd.Series | None = None,
+    hourly_scheduled_push_density: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Construct the feature matrix from raw movement and flight plan columns."""
     F = FEATURES
@@ -445,6 +499,25 @@ def build_features(
         out["arrival_demand"] = arrival_demand
     if F["active_departures_queue"] and active_departures_queue is not None:
         out["active_departures_queue"] = active_departures_queue
+    if F["hourly_scheduled_push_density"] and hourly_scheduled_push_density is not None:
+        out["hourly_scheduled_push_density"] = hourly_scheduled_push_density
+    if F["local_hour_sin"] or F["local_hour_cos"]:
+        ref_time = df["AOBT_3_flt"].fillna(df["MVT_TIME_UTC_mvt"])
+        local_hour = pd.Series(np.nan, index=df.index, dtype=float)
+        for airport, tz in AIRPORT_TIMEZONES.items():
+            mask = df["ADEP_mvt"] == airport
+            if mask.any():
+                local_time = ref_time[mask].dt.tz_convert(tz)
+                local_hour.loc[mask] = (local_time.dt.hour + local_time.dt.minute / 60.0).values
+        unknown = local_hour.isna()
+        if unknown.any():
+            utc_ref = ref_time[unknown]
+            local_hour.loc[unknown] = (utc_ref.dt.hour + utc_ref.dt.minute / 60.0).values
+        angle = 2 * np.pi * local_hour / 24.0
+        if F["local_hour_sin"]:
+            out["local_hour_sin"] = np.sin(angle)
+        if F["local_hour_cos"]:
+            out["local_hour_cos"] = np.cos(angle)
     if F["arvt_update_sec"]:
         out["arvt_update_sec"] = (df["ARVT_3_flt"] - df["ARVT_1_flt"]).dt.total_seconds()
 
@@ -574,8 +647,9 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     recent_delay = compute_recent_delay(deps, CONGESTION_WINDOW_MINUTES)
     arrival_demand = compute_arrival_demand(deps, pool, CONGESTION_WINDOW_MINUTES)
     active_departures_queue = compute_departures_queue(deps)
+    hourly_scheduled_push_density = compute_scheduled_push_density(deps)
     weather = load_weather_cache()
-    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue)
+    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density)
     predictions = np.clip(np.mean([m.predict(features) for m in models], axis=0), 0, None)
 
     template = pd.read_parquet(SUBMISSION_TEMPLATE)
@@ -640,8 +714,10 @@ def main() -> None:
     recent_delay = compute_recent_delay(dep, CONGESTION_WINDOW_MINUTES)
     arrival_demand = compute_arrival_demand(dep, pool, CONGESTION_WINDOW_MINUTES)
     active_departures_queue = compute_departures_queue(dep)
+    print("Computing scheduled push density...")
+    hourly_scheduled_push_density = compute_scheduled_push_density(dep)
 
-    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue)
+    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density)
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = target <= ARTIFACT_TAXI_MAX_SEC  # artifact rows have corrupt labels
 
