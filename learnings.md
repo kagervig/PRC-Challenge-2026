@@ -1293,3 +1293,70 @@ have**: ATC flow-control/regulation status, NOTAMs/runway closures, or convectiv
   = neutral. Regularization/target-transform can't help rows that are unpredictable in principle.
 - **v28 (demand counts) should be reverted** — neutral, adds compute for no gain.
 - The only real lever left is external data (out of scope for this dataset).
+
+> **UPDATE (2026-09-23): the board contradicted this.** v28 (recent_delay +
+> arrival_demand) scored **310.0797 — a −2.92s gain over v27 (313.00)**, despite honest
+> validation calling it neutral. **Keep v28; do not revert.** The disruption/congestion
+> features help on the graded Jan–Jul set more than the winter-weighted honest fold predicts.
+> **Calibration lesson: honest val systematically *understates* congestion/disruption feature
+> value** — the graded set spans the summer months where these signals matter, which the local
+> time-split under-weights. Corollary: a small honest-val gain on a congestion-type feature is
+> worth submitting rather than dismissing.
+
+---
+
+## Departure Queue Congestion — `active_departures_queue` (2026-09-23, v29) — KEPT
+
+Revisited the queue idea with a different formulation and it produced a small but real,
+consistent gain — unlike the two earlier queue attempts.
+
+### The feature
+
+For each departure i at airport A, count same-airport departures that had pushed back but not
+yet taken off at i's pushback instant (`AOBT_3_flt`). Reduces to two strictly backward-looking
+cumulative counts at `t = AOBT_i`:
+
+    active = |{AOBT_j <= t}| - |{MVT_TIME_j <= t}|
+
+i.e. pushed back minus already airborne = current queue length. Both `AOBT_3` and `MVT_TIME`
+are present in training and ranking, so it is train/serve-consistent.
+
+### Bug caught during validation (worth remembering)
+
+First implementation drew the "airborne" count from all departures but the "pushed back" count
+only from rows with a non-null `AOBT_3`. Flights with a missing AOBT then decremented the queue
+without ever incrementing it, so the value drifted monotonically negative (mean **−1105**, min
+**−4084**) — a time-index proxy, not a queue. It even scored **+1.18s** (worse) in that state.
+**Fix:** both counts must come from the same valid-AOBT pool. Corrected stats are sane
+(mean 11.2, median 11, range ~7–15). **Lesson: sanity-check a new feature's distribution before
+trusting its A/B number** — a plausible-looking RMSE can come from a broken feature.
+
+### A/B result (paired, 3 seeds, same time split as honest val)
+
+| Metric | Baseline (OFF) | Queue ON | Delta |
+|---|---|---|---|
+| Honest RMSE | 237.31 | 236.51 | **−0.79** |
+| Clean-only | 223.60 | 222.69 | **−0.91** |
+| EGLL (clean) | 225.1 | 222.7 | −2.4 |
+| LFPG (clean) | 263.8 | 263.4 | −0.4 |
+| LIRF (clean) | 391.7 | 391.5 | −0.2 |
+
+Consistent sign across overall + all three airports (EGLL carries most of it). Feature
+importance 0.98% gain (mid-pack, above `congestion_signal`/`arrival_demand`). Passes the gate
+(improves and well under the 244.0 reference) → **kept as v29**.
+
+**Board-calibration note:** v28's honest-val-"neutral" congestion features scored −2.92s on the
+real board (313.00 → 310.08). Since `active_departures_queue` is the same class of signal and
+shows a *positive* honest-val delta (−0.79/−0.91s), its true board gain is likely larger than
+the honest fold suggests — a strong case to actually submit v29, not just keep the code.
+
+### Why this worked where earlier queue attempts didn't
+
+- "Departure queue (±30 min EOBT count)": +2.1s — a symmetric window around *planned* off-block,
+  counting future flights and using EOBT rather than actual pushback.
+- `concurrent_taxi` (queue length): judged neutral, but measured only on the LIRF-July collapse
+  rows (where throughput *collapses*, so the queue is below average — the wrong test set for a
+  general congestion signal).
+- This version: actual `AOBT`/`MVT_TIME`, strictly backward, evaluated on the whole val slice.
+  The gain is broad-airport (EGLL) surface congestion, not the LIRF-July tail — consistent with
+  the earlier finding that the LIRF collapse is invisible to any volume/queue proxy.

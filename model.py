@@ -35,7 +35,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 28
+SUBMISSION_VERSION = 29
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -66,6 +66,7 @@ FEATURES = {
     "day_deviation_ratio":   True,
     "recent_delay":          True,   # mean AOBT-SCHED of recent departures (departure-side disruption)
     "arrival_demand":        True,   # # arrivals in preceding 60min (inbound surface pressure)
+    "active_departures_queue": True, # departures pushed back but not yet airborne at pushback (queue length)
     # flight plan signal
     "arvt_update_sec":       True,
     # weather
@@ -311,6 +312,44 @@ def compute_recent_delay(departures: pd.DataFrame, window_minutes: int) -> pd.Se
     return result
 
 
+def compute_departures_queue(departures: pd.DataFrame) -> pd.Series:
+    """
+    For each departure, count same-airport departures that had pushed back but not yet
+    taken off at its pushback instant — the length of the departure queue it joins.
+
+    A flight j is "active" for flight i when AOBT_j <= AOBT_i (pushed back at or before i)
+    and MVT_TIME_j > AOBT_i (not yet airborne when i pushes back). The count reduces to
+    two backward-looking cumulative counts at t = AOBT_i:
+        active = |{AOBT_j <= t}| - |{MVT_TIME_j <= t}|
+    the number pushed back minus the number already airborne. Both terms use only events
+    at or before t, so the signal is strictly causal. AOBT_3 and MVT_TIME are present in
+    both training and ranking, keeping it train/serve-consistent.
+    """
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    result = pd.Series(np.nan, index=departures.index, dtype=float)
+
+    ref = departures["AOBT_3_flt"].fillna(departures["MVT_TIME_UTC_mvt"])
+    ref_s_all = (ref - epoch).dt.total_seconds()
+    aobt_s_all = (departures["AOBT_3_flt"] - epoch).dt.total_seconds()
+    mvt_s_all = (departures["MVT_TIME_UTC_mvt"] - epoch).dt.total_seconds()
+
+    for _, dep_group in departures.groupby("ADEP_mvt"):
+        idx = dep_group.index
+        # Pool = flights with a recorded pushback. Both the pushed-back and airborne
+        # counts must come from the SAME pool: a flight without an AOBT never joins the
+        # queue, so it must not count as an airborne departure leaving it either —
+        # otherwise the difference drifts negative across the record.
+        has_aobt = aobt_s_all.loc[idx].notna().values
+        aobt = np.sort(aobt_s_all.loc[idx].values[has_aobt])
+        mvt = np.sort(mvt_s_all.loc[idx].values[has_aobt])
+        t = ref_s_all.loc[idx].values
+        pushed = np.searchsorted(aobt, t, side="right")
+        airborne = np.searchsorted(mvt, t, side="right")
+        result.loc[idx] = (pushed - airborne).astype(float)
+
+    return result
+
+
 def compute_arrival_demand(
     departures: pd.DataFrame, arrival_pool: pd.DataFrame, window_minutes: int
 ) -> pd.Series:
@@ -356,6 +395,7 @@ def build_features(
     weather: "pd.DataFrame | None" = None,
     recent_delay: pd.Series | None = None,
     arrival_demand: pd.Series | None = None,
+    active_departures_queue: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Construct the feature matrix from raw movement and flight plan columns."""
     F = FEATURES
@@ -397,6 +437,8 @@ def build_features(
         out["recent_delay"] = recent_delay
     if F["arrival_demand"] and arrival_demand is not None:
         out["arrival_demand"] = arrival_demand
+    if F["active_departures_queue"] and active_departures_queue is not None:
+        out["active_departures_queue"] = active_departures_queue
     if F["arvt_update_sec"]:
         out["arvt_update_sec"] = (df["ARVT_3_flt"] - df["ARVT_1_flt"]).dt.total_seconds()
 
@@ -525,8 +567,9 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     day_deviation = compute_day_deviation_ratio(deps, pool)
     recent_delay = compute_recent_delay(deps, CONGESTION_WINDOW_MINUTES)
     arrival_demand = compute_arrival_demand(deps, pool, CONGESTION_WINDOW_MINUTES)
+    active_departures_queue = compute_departures_queue(deps)
     weather = load_weather_cache()
-    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand)
+    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue)
     predictions = np.clip(np.mean([m.predict(features) for m in models], axis=0), 0, None)
 
     template = pd.read_parquet(SUBMISSION_TEMPLATE)
@@ -590,8 +633,9 @@ def main() -> None:
     print("Computing recent-delay and arrival-demand signals...")
     recent_delay = compute_recent_delay(dep, CONGESTION_WINDOW_MINUTES)
     arrival_demand = compute_arrival_demand(dep, pool, CONGESTION_WINDOW_MINUTES)
+    active_departures_queue = compute_departures_queue(dep)
 
-    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand)
+    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue)
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = target <= ARTIFACT_TAXI_MAX_SEC  # artifact rows have corrupt labels
 
