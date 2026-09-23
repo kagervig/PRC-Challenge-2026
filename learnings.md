@@ -1356,6 +1356,43 @@ twice (n=2): **on congestion/disruption features, multiply the honest-val delta 
 anticipate the board, and submit even small positive honest-val gains of this feature class.**
 Running board: v27 313.00 → v28 310.08 → **v29 308.0**.
 
+---
+
+## Feature-tuning harness + summer-weighted baseline (2026-09-23) — Phase 0
+
+Built `tune_harness.py`: rolling Apr–Jul folds (train on prior clean months, eval on target
+month with artifacts kept + override applied), row-weighted pooled RMSE, paired 3-seed,
+per-feature window overrides. Fast proxy config (lr=0.05, 600 rounds fixed, no early stopping
+to avoid eval leakage) — absolute RMSE differs from the real lr=0.02/3000-round model but
+relative deltas rank correctly; confirm adopted changes at full config before submitting.
+
+**Why:** the single winter split understates congestion features ~2–3× (see v28/v29 above).
+The summer-weighted pooled honest RMSE tracks the board directly:
+
+| | winter split | summer-weighted (this harness) | board |
+|---|---|---|---|
+| current model | ~237 | **315.02** (clean 266.70) | 308 (v29) |
+
+Per-month baseline: Apr 228.6 / May 318.4 / Jun 342.8 / **Jul 350.4** (honest). Per-airport:
+LFPG 252.0, **LIRF 761.3**, EGLL 250.9. July/LIRF dominate — the known capacity-collapse wall.
+
+**This 315.02 pooled honest is the anchor** all feature-tuning phases compare against.
+
+### Phase 2 — active_departures_queue variants (each added on top of raw queue)
+
+| variant | honest | Δ | clean | Δ |
+|---|---|---|---|---|
+| runway_queue | 314.64 | **−0.38** | 266.07 | **−0.64** |
+| queue_norm | 314.74 | −0.28 | 266.32 | −0.39 |
+| queue_strict_ahead | 314.86 | −0.15 | 266.46 | −0.24 |
+| queue_rate_15m | 314.95 | −0.07 | 266.37 | −0.33 |
+
+**Decision: adopt `runway_queue` (per-runway queue length); drop the other three** — tiny and
+collinear with the raw queue, not worth the overfitting risk. Variant defs live in
+`phase2_sweep.py`; promote runway_queue into model.py in the combined adoption step. All Phase-2
+gains are small — consistent with the incremental-upside expectation; the LIRF-July wall is
+untouched.
+
 ### Why this worked where earlier queue attempts didn't
 
 - "Departure queue (±30 min EOBT count)": +2.1s — a symmetric window around *planned* off-block,
