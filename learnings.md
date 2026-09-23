@@ -1242,3 +1242,54 @@ floor. This is the next step — zero submissions, decides the strategy.
 **Bottom line:** v27=313.00 (a 42% cut from the original 573.8, almost all from understanding
 data defects). We're within ~90s of the winter clean floor (~225). Whether that last stretch is
 reachable hinges on the artifacts-vs-shift fork above.
+
+---
+
+## Clean-Model Ceiling Investigation (2026-09-22) — the LIRF/July wall
+
+Ran the rolling-season honest val to resolve the fork, then tried to attack the gap. **The
+fork resolved as seasonal shift — but the shift is unpredictable operational variance, not a
+missing feature.** Feature-based clean-model work is effectively exhausted at ~313.
+
+### Fork resolved: shift is real, and it's a summer/LIRF phenomenon
+
+Rolling-origin clean-only RMSE (train on prior clean months, eval on month):
+
+| Nov | Dec | Apr | May | Jun | **Jul** | Aug | Sep | Oct |
+|---|---|---|---|---|---|---|---|---|
+| 219.7 | 231.8 | 230.6 | 241.2 | 269.8 | **323.6** | 260.6 | 252.5 | 245.8 |
+
+The model is ~100s worse in July than winter. Since the graded set is Jan–Jul, this summer
+degradation is much of why the board (313) exceeds the winter honest-val (239).
+
+### The July spike is LIRF real long-taxi disruption days
+
+- July error is **44% LIRF**, LIRF-July RMSE **763.8** (vs 185–320 elsewhere).
+- Worst rows are *real* long taxis (median ~5,000s, 72% underpredictions), clustered on
+  specific days — e.g. **2025-07-13: 478 departures, mean taxi 2,439s (~40 min).**
+- These are **departure-side capacity collapses** (runway works / flow control / single-runway
+  ops): normal-or-low volume, huge taxi times.
+
+### Every serve-available disruption signal is blind to them (all tested, all failed)
+
+| Signal | Result on LIRF-July |
+|---|---|
+| `day_deviation_ratio` | 0.99 (normal) on worst rows — ARR-taxi-in based, arrivals unaffected |
+| `congestion_signal` | ≈ LIRF average — same reason |
+| `demand_count` (deps in 60min) | neutral (−1.8 to +0.1s); volume is normal on collapse days |
+| `concurrent_taxi` (queue length) | no help; Jul-13 queue was *below* average (throughput collapse, not overload) |
+
+**Root cause of the wall:** a capacity collapse manifests *only* in departure taxi-out time —
+which is the withheld target at serve. Arrivals taxi normally; volume/queue are normal. No
+volume/demand/arrival proxy can reflect it. Closing this would need **external data we don't
+have**: ATC flow-control/regulation status, NOTAMs/runway closures, or convective weather.
+
+### Verdict
+
+- **~313 is the practical clean-model floor** with the available data. The remaining error is
+  unpredictable LIRF capacity-collapse days + a few residual artifacts.
+- Feature avenues from the earlier plan are closed: #1 demand-count = neutral (built as v28 but
+  **not worth submitting**); #2 de-icing targets winter, not the summer spike; queue/concurrency
+  = neutral. Regularization/target-transform can't help rows that are unpredictable in principle.
+- **v28 (demand counts) should be reverted** — neutral, adds compute for no gain.
+- The only real lever left is external data (out of scope for this dataset).

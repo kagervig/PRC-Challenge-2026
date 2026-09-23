@@ -35,7 +35,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 27
+SUBMISSION_VERSION = 28
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -64,6 +64,8 @@ FEATURES = {
     "congestion_signal":     True,
     "congestion_acceleration": False, # ablation: −0.7s, adds noise
     "day_deviation_ratio":   True,
+    "recent_delay":          True,   # mean AOBT-SCHED of recent departures (departure-side disruption)
+    "arrival_demand":        True,   # # arrivals in preceding 60min (inbound surface pressure)
     # flight plan signal
     "arvt_update_sec":       True,
     # weather
@@ -272,6 +274,78 @@ def compute_day_deviation_ratio(
     return result
 
 
+def compute_recent_delay(departures: pd.DataFrame, window_minutes: int) -> pd.Series:
+    """
+    For each departure, the mean off-block delay (AOBT_3 - SCHED) of same-airport
+    departures that pushed back in the preceding window_minutes.
+
+    A departure-side disruption signal. During a capacity collapse aircraft push back
+    early (to free gates) but hold off-blocks, so their flight-plan AOBT is stamped late
+    and AOBT - SCHED spikes; the rolling mean therefore rises during exactly the windows
+    where taxi-out balloons. Both AOBT_3 and SCHED are present in training and ranking,
+    and only past departures are used, so it is causal and train/serve-consistent. This
+    sees the departure-side disruption that the arrival-taxi-in day_deviation_ratio misses.
+    """
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    window_s = window_minutes * 60.0
+    result = pd.Series(np.nan, index=departures.index, dtype=float)
+
+    ref = departures["AOBT_3_flt"].fillna(departures["MVT_TIME_UTC_mvt"])
+    ref_s_all = (ref - epoch).dt.total_seconds()
+    delay_all = (ref - departures["SCHED_TIME_UTC_mvt"]).dt.total_seconds()
+
+    for _, dep_group in departures.groupby("ADEP_mvt"):
+        order = ref_s_all.loc[dep_group.index].sort_values().index
+        t = ref_s_all.loc[order].values
+        d = delay_all.loc[order].values
+        hi = np.searchsorted(t, t, side="left")
+        lo = np.searchsorted(t, t - window_s, side="left")
+        valid = ~np.isnan(d)
+        cum_sum = np.concatenate([[0.0], np.cumsum(np.where(valid, d, 0.0))])
+        cum_count = np.concatenate([[0], np.cumsum(valid.astype(int))])
+        window_sum = cum_sum[hi] - cum_sum[lo]
+        window_count = cum_count[hi] - cum_count[lo]
+        vals = np.where(window_count > 0, window_sum / np.maximum(window_count, 1), np.nan)
+        result.loc[order] = vals
+
+    return result
+
+
+def compute_arrival_demand(
+    departures: pd.DataFrame, arrival_pool: pd.DataFrame, window_minutes: int
+) -> pd.Series:
+    """
+    For each departure, the count of arrivals at the same airport in the preceding
+    window_minutes — surface pressure from inbound traffic sharing the taxiways.
+
+    arrival_pool is build_congestion_pool output (ADES mapped to ADEP_mvt, MVT_TIME the
+    arrival/landing time). Arrival times are present in both training and ranking, so the
+    signal is train/serve-consistent. Distinct from congestion_signal (arrival taxi-in
+    duration): this is arrival volume, not how long arrivals took.
+    """
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    window_s = window_minutes * 60.0
+    result = pd.Series(0.0, index=departures.index, dtype=float)
+
+    arr_ref = (arrival_pool["MVT_TIME_UTC_mvt"] - epoch).dt.total_seconds()
+    arr_sorted = {
+        k: np.sort(arr_ref.loc[idx].values)
+        for k, idx in arrival_pool.groupby("ADEP_mvt").groups.items()
+    }
+    dep_ref = (departures["AOBT_3_flt"].fillna(departures["MVT_TIME_UTC_mvt"]) - epoch).dt.total_seconds()
+
+    for airport, dep_group in departures.groupby("ADEP_mvt"):
+        arr = arr_sorted.get(airport)
+        if arr is None or len(arr) == 0:
+            continue
+        ref_s = dep_ref.loc[dep_group.index].values
+        hi = np.searchsorted(arr, ref_s, side="left")
+        lo = np.searchsorted(arr, ref_s - window_s, side="left")
+        result.loc[dep_group.index] = (hi - lo).astype(float)
+
+    return result
+
+
 # -- Feature engineering ------------------------------------------------------
 
 def build_features(
@@ -280,6 +354,8 @@ def build_features(
     day_deviation: pd.Series,
     congestion_acceleration: pd.Series,
     weather: "pd.DataFrame | None" = None,
+    recent_delay: pd.Series | None = None,
+    arrival_demand: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Construct the feature matrix from raw movement and flight plan columns."""
     F = FEATURES
@@ -317,6 +393,10 @@ def build_features(
     if F["congestion_signal"]:     out["congestion_signal"]     = congestion
     if F["congestion_acceleration"]: out["congestion_acceleration"] = congestion_acceleration
     if F["day_deviation_ratio"]:   out["day_deviation_ratio"]   = day_deviation
+    if F["recent_delay"] and recent_delay is not None:
+        out["recent_delay"] = recent_delay
+    if F["arrival_demand"] and arrival_demand is not None:
+        out["arrival_demand"] = arrival_demand
     if F["arvt_update_sec"]:
         out["arvt_update_sec"] = (df["ARVT_3_flt"] - df["ARVT_1_flt"]).dt.total_seconds()
 
@@ -443,8 +523,10 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     congestion_short = compute_congestion_signal(deps, pool, CONGESTION_WINDOW_SHORT_MINUTES)
     congestion_acceleration = congestion_short - congestion
     day_deviation = compute_day_deviation_ratio(deps, pool)
+    recent_delay = compute_recent_delay(deps, CONGESTION_WINDOW_MINUTES)
+    arrival_demand = compute_arrival_demand(deps, pool, CONGESTION_WINDOW_MINUTES)
     weather = load_weather_cache()
-    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather)
+    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand)
     predictions = np.clip(np.mean([m.predict(features) for m in models], axis=0), 0, None)
 
     template = pd.read_parquet(SUBMISSION_TEMPLATE)
@@ -505,8 +587,11 @@ def main() -> None:
     congestion_acceleration = congestion_short - congestion
     print(f"Computing day deviation ratio (min_flights={MIN_DAY_FLIGHTS})...")
     day_deviation = compute_day_deviation_ratio(dep, pool)
+    print("Computing recent-delay and arrival-demand signals...")
+    recent_delay = compute_recent_delay(dep, CONGESTION_WINDOW_MINUTES)
+    arrival_demand = compute_arrival_demand(dep, pool, CONGESTION_WINDOW_MINUTES)
 
-    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather)
+    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand)
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = target <= ARTIFACT_TAXI_MAX_SEC  # artifact rows have corrupt labels
 
