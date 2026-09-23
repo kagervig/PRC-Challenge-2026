@@ -1133,6 +1133,10 @@ Override a row's prediction with `MVT − SCHED` when **all** of:
 - It flagged **21 ranking rows** (18 LIRF, 2 LFPG, 1 LSZH), values 10–31h.
 - Result: **490.73 → 358.45**, saving 3.87e10 SSE — matching the model's estimate.
 
+> **REFINED (2026-09-22, v27): restrict to `ADEP == LIRF` only.** The 83% precision was
+> LIRF (44 TP / 0 FP) diluted by LFPG (0 TP / 8 FP) and LSZH (0 TP / 1 FP) — the two extra
+> airports contribute *only* false positives. See "Override False-Positive Fix" below.
+
 ### Why the separator works despite `BLOCK_TIME` being hidden
 
 The only thing distinguishing an artifact from a genuinely-delayed flight is where the
@@ -1158,3 +1162,83 @@ captured most of the recoverable value. Remaining levers are small: the residual
 **Status:** v25 is a post-processing derivative of v22 (not yet codified in `model.py`).
 Once confirmed (it is — 358.45), fold the override into `apply_artifact_override` so it's
 reproducible, alongside the existing `proxy_taxi > 50000` branch.
+
+---
+
+## Override False-Positive Fix + Error Re-decomposition (2026-09-22) — 358.5 → 349.8 → ~313
+
+### Score progression continued
+
+| Ver | Score | Change |
+|---|---|---|
+| v25 | 358.45 | LIRF/LFPG/LSZH no-plan override (post-process on v22) |
+| v26 | **349.83** | override codified in `model.py` + on v24's model (dest + plan-delta features) |
+| v27 | **313.00** | **override restricted to LIRF-only** (removes LFPG/LSZH false positives) — matched the 312.9 estimate |
+
+### The override had false positives — all the signal was LIRF
+
+Once the override was codified and re-examined per-airport, the "83% precision" turned out to
+be **100% LIRF diluted by two pure-noise airports**:
+
+| Airport | TP | FP | Precision |
+|---|---|---|---|
+| LIRF | 44 | 0 | 100% |
+| LFPG | 0 | 8 | 0% |
+| LSZH | 0 | 1 | 0% |
+
+LFPG/LSZH have no-plan + delayed flights (real taxi ~840s) that match the mask but are *not*
+artifacts — the override was assigning them ~day-long taxis. The two LFPG training artifacts
+never matched this pattern (different flavour). **Fix: `ARTIFACT_AIRPORTS = {"LIRF"}` (v27).**
+On the ranking set this reverts 3 false positives (2 LFPG at 52,555s/69,540s, 1 LSZH at
+36,187s → back to model values ~600–2,300s), estimated ~349.8 → ~313.
+
+**Lesson:** validate override precision *per detected subgroup*, not in aggregate — an
+aggregate rate can hide a subgroup that is pure false positives.
+
+### Where the error lives now (honest validation, override applied)
+
+With artifacts handled, the picture flipped back to clean-model-dominated:
+- **Artifacts: ~6% of validation SSE** (overrides did their job).
+- **Clean rows: ~94%**, and extremely concentrated — worst 1% of clean rows ≈ 68% of clean SSE.
+- **LFPG is the largest genuine concentration.** Setting aside the override FPs, LFPG has a
+  real tail of long taxis (2–9h, within the clean <6h range) — winter, runways 26R/08L,
+  midday — that the model underpredicts. Signature points to de-icing / holding that
+  `weather_temp_c` doesn't fully capture. (Caveat: measured with a fast single-seed diagnostic
+  model at clean-only ~318 vs the real ensemble's ~225, so magnitudes are inflated; the LFPG
+  concentration is directionally real.)
+
+### Reframe at v27=313: clean-model work re-opens
+
+With artifacts handled, the SSE mix flipped and clean-model work is worth ~2–2.5× what it was:
+
+| | at v22 (490) | at v27 (313) |
+|---|---|---|
+| clean-model share of SSE | ~21% | **~52%** |
+| board move per 10% clean-RMSE gain | ~11s | **~16s** |
+
+So `dest`/plan-deltas/regularization/LFPG — dismissed as ~30× diluted at 490 — are back on the
+table with modest but real payoff now that artifacts no longer dominate.
+
+### The open fork (decides whether clean work pays off)
+
+The board (313.00) sits ~74s above the **winter** honest-val (238.7). That gap is *either*:
+- **~2 more undetectable artifacts** in the 2026 set → floor, clean work won't touch it; or
+- **seasonal/year shift** — clean model genuinely worse on 2026 spring/summer than winter 2025
+  → clean work lowers the board.
+
+The winter-only honest fold can't tell which. **Rolling-season honest val (`honest_val.py`,
+Apr–Jul folds)** resolves it: if clean-RMSE climbs from ~225 (winter) toward ~280+ (summer),
+the gap is shift and clean work helps; if it stays ~225, the gap is artifacts and we're at the
+floor. This is the next step — zero submissions, decides the strategy.
+
+### Remaining avenues
+
+1. **Diagnose the fork first** (rolling honest val) — highest information, zero cost.
+2. **If shift:** clean-model work — LFPG long-taxi tail (de-icing/holding not captured by
+   `weather_temp_c`), regularization/early-stopping, features. Now ~2× more effective than before.
+3. **Residual artifacts** (~1–3 rows) — Flavour-A below 10h or without the no-plan signature;
+   the [6,10h] band is 38% precision, not worth it. Likely a hard floor.
+
+**Bottom line:** v27=313.00 (a 42% cut from the original 573.8, almost all from understanding
+data defects). We're within ~90s of the winter clean floor (~225). Whether that last stretch is
+reachable hinges on the artifacts-vs-shift fork above.

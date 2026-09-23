@@ -21,6 +21,13 @@ ARTIFACT_PROXY_THRESHOLD_SEC = 50000
 # excluded from training (corrupt labels) but KEPT in honest validation because the
 # grader scores them.
 ARTIFACT_TAXI_MAX_SEC = 21600
+# Second artifact flavour: BLOCK_TIME (withheld) carries the bad date while the whole
+# flight plan is missing (AOBT null). SCHED tracks the corruption, so MVT_TIME - SCHED
+# equals the corrupted label. LIRF-only: it is the sole airport where this pattern is
+# real (44 TP / 0 FP in training); LFPG and LSZH no-plan+delayed flights are 0/9 — pure
+# false positives that get assigned a ~day-long taxi. Threshold guards the low end.
+ARTIFACT_AIRPORTS = {"LIRF"}
+ARTIFACT_NOPLAN_MIN_SEC = 36000  # 10h
 
 DATA_DIR = Path(__file__).parent
 PREDICTIONS_DIR = DATA_DIR / "predictions"
@@ -28,7 +35,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 24
+SUBMISSION_VERSION = 27
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -382,32 +389,41 @@ def apply_artifact_override(
     """
     Override predictions for detectable date-rollover artifacts and re-clip to >= 0.
 
-    A data-entry error records AOBT_3_flt and MVT_TIME_UTC_mvt a full calendar day
-    apart, so the ground-truth TAXITIME (MVT_TIME - BLOCK_TIME, with BLOCK_TIME
-    tracking AOBT) is ~86400s. proxy_taxi (MVT_TIME - AOBT_3_flt) exceeds a full day
-    on these rows and nowhere else, and training confirms it matches the buggy label,
-    so predicting proxy_taxi directly is the best available estimate. Only the flavour
-    where MVT_TIME (not the hidden BLOCK_TIME) carries the bad date is detectable here;
-    normal near-midnight flights are left to the model. Re-clipping guards against
-    negative proxy_taxi values.
+    A data-entry error records a flight's off-block and takeoff a full calendar day
+    apart, so the ground-truth TAXITIME (MVT_TIME - BLOCK_TIME) is a physically
+    impossible ~day. Two detectable flavours:
+
+    - Flavour B: MVT_TIME carries the bad date; AOBT_3 is present, so
+      proxy_taxi (MVT_TIME - AOBT_3) exceeds a full day and equals the corrupted label.
+    - Flavour A: BLOCK_TIME (withheld) carries the bad date; the whole flight plan is
+      missing (AOBT null) and SCHED tracks the corruption, so MVT_TIME - SCHED equals
+      the corrupted label (to ~3s in training). Restricted to ARTIFACT_AIRPORTS and a
+      >ARTIFACT_NOPLAN_MIN_SEC gap — elsewhere/below it, legitimately-delayed no-plan
+      flights are false positives.
+
+    Training confirms the assigned value matches the buggy label for both, so predicting
+    it directly is the best available estimate. Re-clipping guards against negatives.
     """
-    proxy_taxi = (deps["MVT_TIME_UTC_mvt"] - deps["AOBT_3_flt"]).dt.total_seconds()
-    artifact_mask = proxy_taxi > ARTIFACT_PROXY_THRESHOLD_SEC
     out = pred_series.copy()
-    out.loc[artifact_mask] = proxy_taxi[artifact_mask]
+
+    proxy_taxi = (deps["MVT_TIME_UTC_mvt"] - deps["AOBT_3_flt"]).dt.total_seconds()
+    proxy_mask = proxy_taxi > ARTIFACT_PROXY_THRESHOLD_SEC
+    out.loc[proxy_mask] = proxy_taxi[proxy_mask]
+
+    mvt_sched = (deps["MVT_TIME_UTC_mvt"] - deps["SCHED_TIME_UTC_mvt"]).dt.total_seconds()
+    noplan_mask = (
+        deps["ADEP_mvt"].isin(ARTIFACT_AIRPORTS)
+        & deps["AOBT_3_flt"].isna()
+        & (mvt_sched > ARTIFACT_NOPLAN_MIN_SEC)
+    )
+    out.loc[noplan_mask] = mvt_sched[noplan_mask]
+
     if verbose:
-        n_artifacts = int(artifact_mask.sum())
-        if n_artifacts > 0:
-            airports = deps.loc[artifact_mask, "ADEP_mvt"].value_counts().to_dict()
-            print(f"  Date-rollover override: {n_artifacts} row(s) at {airports}")
-            for idx in deps.index[artifact_mask]:
-                assigned = proxy_taxi[idx]
-                print(
-                    f"    {deps.at[idx, 'ADEP_mvt']} MVT_ID={deps.at[idx, 'MVT_ID_mvt']} "
-                    f"proxy_taxi={assigned:.0f}s -> assigned {assigned:.0f}s"
-                )
-        else:
-            print("  Date-rollover override: no artifact rows detected")
+        print(
+            f"  Artifact override: {int(proxy_mask.sum())} proxy row(s) (Flavour B), "
+            f"{int(noplan_mask.sum())} no-plan row(s) (Flavour A) at "
+            f"{deps.loc[noplan_mask, 'ADEP_mvt'].value_counts().to_dict()}"
+        )
     return out.clip(lower=0)
 
 
