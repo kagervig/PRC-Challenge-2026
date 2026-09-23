@@ -35,7 +35,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 29
+SUBMISSION_VERSION = 30
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -60,6 +60,8 @@ FEATURES = {
     "proxy_taxi":            True,   # MVT_TIME - AOBT_3; target-adjacent, strongest single signal
     "aobt_lobt_sec":         True,   # AOBT_3 - LOBT; off-block vs latest plan (−1.5s clean val)
     "eobt_iobt_sec":         True,   # EOBT_1 - IOBT; replanning churn (−1.2s clean val)
+    "plan_slippage_sec":     True,   # AOBT_3 - IOBT; total slippage from initial plan to actual off-block
+    "eobt_slippage_sec":     True,   # AOBT_3 - EOBT_1; ATC schedule slippage from revised estimate
     # congestion signals
     "congestion_signal":     True,
     "congestion_acceleration": False, # ablation: −0.7s, adds noise
@@ -430,6 +432,10 @@ def build_features(
         out["aobt_lobt_sec"] = (df["AOBT_3_flt"] - df["LOBT_flt"]).dt.total_seconds()
     if F["eobt_iobt_sec"]:
         out["eobt_iobt_sec"] = (df["EOBT_1_flt"] - df["IOBT_flt"]).dt.total_seconds()
+    if F["plan_slippage_sec"]:
+        out["plan_slippage_sec"] = (df["AOBT_3_flt"] - df["IOBT_flt"]).dt.total_seconds().fillna(0)
+    if F["eobt_slippage_sec"]:
+        out["eobt_slippage_sec"] = (df["AOBT_3_flt"] - df["EOBT_1_flt"]).dt.total_seconds().fillna(0)
     if F["congestion_signal"]:     out["congestion_signal"]     = congestion
     if F["congestion_acceleration"]: out["congestion_acceleration"] = congestion_acceleration
     if F["day_deviation_ratio"]:   out["day_deviation_ratio"]   = day_deviation
