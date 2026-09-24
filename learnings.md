@@ -1434,6 +1434,69 @@ misses. `recent_delay` EWMA ties boxcar-15 at best — keep the boxcar.
 Each measured against a different baseline, so effects don't simply add. Rough stack on the
 summer-weighted metric: 315.0 → ~313.5 (~1.5s). Confirm with a full 9-seed run before submitting.
 
+---
+
+## LIRF high-taxi diagnostic (2026-09-23) — it's runway reconfiguration, and it's observable
+
+Ran a per-day/per-hour diagnostic on LIRF clean departures (artifacts excluded). Findings
+**revise the earlier "LIRF collapse needs external data" verdict** — the dominant signature is
+partly serve-available.
+
+### LIRF has no normal days — structurally long, not just July
+
+- **0 of 365 days** average taxi ≤ 600s; **120 of 365** exceed 1200s. LIRF's taxi is
+  structurally long, with frequent spike days on top — not a handful of July collapses on a
+  calm baseline. (This is why LIRF is ~47% of summer SSE from ~8% of rows.)
+
+### The spike is runway reconfiguration (hourly evidence)
+
+Runway 25 handles ~87% of LIRF departures normally (~900–1200s taxi). Taxi **triples the hour
+16R/34L enter the mix and stays high through single-runway periods.** 2025-07-13 (worst, mean
+2435s): `[25]` mornings ~1000s → `[16R,25]` 07–11h **3000–3400s** → `[16R]`-only afternoon
+2500–3000s. Same on 07-28 (`[25,34L]` midday → 4000s+). High days average 2.82 distinct
+runways/day = the airport reconfigures mid-day.
+
+### Not operator/segment concentrated
+
+Brunt is broad — Mainline (1287s) + Lowcost (1218s) are the bulk; Non-Scheduled worst (1898s)
+but only 420 flights. Airport/runway phenomenon, not a carrier to target. Stand holds
+(`AOBT−EOBT` ~420s) are already captured by `gate_delay_sec`.
+
+### Why this reopens the wall
+
+`RUNWAY_mvt` is in the data and already a per-flight feature — but the model sees it *statically*
+and misses the **temporal reconfiguration dynamics**: config just switched / single-runway ops
+now / on the minority runway → queues back up. Those are computable, causal, serve-available
+signals from recent departures' realized runways, **not external data**. Candidate features to
+test (Phase 4): `active_runway_count` (last 30–60min), `runway_changed_recently` /
+minutes-since-config-change, `on_minority_runway`. Targets ~47% of the error, so even partial
+capture could beat Phases 1–3 combined. **Caveat: confirm RUNWAY_mvt is the *assigned* (not
+just post-hoc realized) runway available at pushback in the ranking set.**
+
+### Phase 4 result — reconfiguration signals FAIL (2026-09-23)
+
+Built `active_runway_count_30m/_60m` and `minority_runway_share_60m` (runway usage timestamped
+at takeoff, queried at pushback; causal, RUNWAY_mvt 0% null in ranking) and A/B'd on the harness
+vs the v33 baseline (313.30):
+
+| + variant | honest Δ | LIRF |
+|---|---|---|
+| active_runway_count_30m | +0.50 | ~759 (flat) |
+| active_runway_count_60m | +0.65 | ~759 (flat) |
+| minority_runway_share_60m | +0.51 | 759.3 (flat) |
+| all three | +0.43 | 759.0 (flat) |
+
+**All worse; LIRF completely unmoved. Reverted (never entered model.py).**
+
+**The optimism was wrong — and this is the lesson.** The runway config *correlates* with LIRF
+spikes at the day/hour level, but the model **already has RUNWAY_mvt + hour + airport**, so
+"16R at hour 10" is already learnable; the aggregate reconfiguration abstractions add only noise.
+Day/hour correlation ≠ a usable per-flight signal. The LIRF residual is the extreme tail of real
+long taxis the model **underpredicts in magnitude** — knowing the config doesn't reveal how bad
+the spike will be. **Verdict re-confirmed (now tested, not assumed): the LIRF wall (~47% of
+error) is not closable with runway data on hand; it needs external inputs (ATC flow-control /
+regulations, NOTAMs, convective weather).**
+
 ### Why this worked where earlier queue attempts didn't
 
 - "Departure queue (±30 min EOBT count)": +2.1s — a symmetric window around *planned* off-block,

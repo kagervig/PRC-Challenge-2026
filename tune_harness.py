@@ -41,27 +41,25 @@ def load():
     return dep, pool, weather
 
 
-def prepare(dep, pool, weather,
-            cong_window=model.CONGESTION_WINDOW_MINUTES,
-            recent_window=model.CONGESTION_WINDOW_MINUTES,
-            arrdem_window=model.CONGESTION_WINDOW_MINUTES,
-            extra=None):
+def prepare(dep, pool, weather, extra=None):
     """
-    Build the full feature matrix, replicating model.main()'s sequence.
+    Build the full feature matrix, replicating model.main()'s current (v32) sequence.
 
-    The three windows default to the current shared constant (so defaults reproduce the
-    live model exactly). Phase 1 varies them independently. `extra` is a dict of
-    {column: Series} merged in after build_features for testing new candidate features.
+    Mirrors the live model: EWMA congestion, recent_delay=15min, airport + runway queues.
+    `extra` is a dict of {column: Series} merged in after build_features for testing new
+    candidate features (e.g. Phase 4 runway-reconfiguration signals).
     """
-    cong = model.compute_congestion_signal(dep, pool, cong_window)
+    cong = model.compute_congestion_ewma(dep, pool, model.CONGESTION_EWMA_HALFLIFE_MIN)
     cong_short = model.compute_congestion_signal(dep, pool, model.CONGESTION_WINDOW_SHORT_MINUTES)
     dayd = model.compute_day_deviation_ratio(dep, pool)
-    recent = model.compute_recent_delay(dep, recent_window)
-    arrdem = model.compute_arrival_demand(dep, pool, arrdem_window)
+    recent = model.compute_recent_delay(dep, model.RECENT_DELAY_WINDOW_MINUTES)
+    arrdem = model.compute_arrival_demand(dep, pool, model.CONGESTION_WINDOW_MINUTES)
     queue = model.compute_departures_queue(dep)
+    runway_queue = model.compute_runway_queue(dep)
     sched = model.compute_scheduled_push_density(dep)
+    lead_wake = model.compute_lead_wake_category(dep)
     feats = model.build_features(dep, cong, dayd, cong_short - cong, weather,
-                                 recent, arrdem, queue, sched)
+                                 recent, arrdem, queue, sched, runway_queue, lead_wake)
     if extra:
         for col, series in extra.items():
             feats[col] = series
@@ -79,7 +77,12 @@ def evaluate(feats, dep, label, seeds=SEEDS, verbose=True):
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = (target <= model.ARTIFACT_TAXI_MAX_SEC).values
     mo = dep["MVT_TIME_UTC_mvt"].dt.month.values
-    cats = list(model.CATEGORICAL_FEATURES)
+    # Guard against prepare() drifting behind model.py: only pass categoricals that were
+    # actually built, and warn loudly so the missing feature gets noticed (not silently dropped).
+    cats = [c for c in model.CATEGORICAL_FEATURES if c in feats.columns]
+    missing = set(model.CATEGORICAL_FEATURES) - set(cats)
+    if missing:
+        print(f"  WARNING: categoricals in model but missing from prepare(): {missing}")
 
     all_y, all_adj, all_clean, all_ap = [], [], [], []
     per_month = []

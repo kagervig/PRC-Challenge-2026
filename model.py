@@ -38,7 +38,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 32
+SUBMISSION_VERSION = 33
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -90,6 +90,8 @@ FEATURES = {
     "active_departures_queue": True, # departures pushed back but not yet airborne at pushback (queue length)
     "runway_queue":          True,   # v32: per-runway departure queue length (−0.38s on top of airport queue)
     "hourly_scheduled_push_density": True, # count of SCHED_TIME departures at same airport ±30min of AOBT_3
+    # wake turbulence
+    "prior_flight_wake_cat": True,   # WK_TBL_CAT of immediately preceding departure on same (airport, runway)
     # flight plan signal
     "arvt_update_sec":       True,
     # weather
@@ -103,6 +105,7 @@ FEATURES = {
 _CATEGORICAL = {
     "airport", "dest", "runway", "stand", "stand_prefix",
     "airline", "weight_class", "market_segment", "month",
+    "prior_flight_wake_cat",
 }
 CATEGORICAL_FEATURES = [f for f in _CATEGORICAL if FEATURES.get(f, False)]
 
@@ -492,6 +495,24 @@ def compute_scheduled_push_density(
     return result
 
 
+# -- Wake turbulence ----------------------------------------------------------
+
+def compute_lead_wake_category(departures: pd.DataFrame) -> pd.Series:
+    """
+    For each departure, the wake turbulence category of the immediately preceding
+    departure on the same (airport, runway), ordered by MVT_TIME_UTC_mvt.
+
+    Returns UNKNOWN for the first flight on each runway segment and for any
+    predecessor whose WK_TBL_CAT_flt is NaN.
+    """
+    result = pd.Series("UNKNOWN", index=departures.index, dtype=object)
+    sorted_deps = departures.sort_values(["ADEP_mvt", "RUNWAY_mvt", "MVT_TIME_UTC_mvt"])
+    for _, group in sorted_deps.groupby(["ADEP_mvt", "RUNWAY_mvt"]):
+        prior = group["WK_TBL_CAT_flt"].shift(1).fillna("UNKNOWN")
+        result.loc[group.index] = prior.values
+    return result.astype("category")
+
+
 # -- Feature engineering ------------------------------------------------------
 
 def build_features(
@@ -505,6 +526,7 @@ def build_features(
     active_departures_queue: pd.Series | None = None,
     hourly_scheduled_push_density: pd.Series | None = None,
     runway_queue: pd.Series | None = None,
+    lead_wake_cat: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Construct the feature matrix from raw movement and flight plan columns."""
     F = FEATURES
@@ -556,6 +578,8 @@ def build_features(
         out["runway_queue"] = runway_queue
     if F["hourly_scheduled_push_density"] and hourly_scheduled_push_density is not None:
         out["hourly_scheduled_push_density"] = hourly_scheduled_push_density
+    if F["prior_flight_wake_cat"] and lead_wake_cat is not None:
+        out["prior_flight_wake_cat"] = lead_wake_cat
     if F["local_hour_sin"] or F["local_hour_cos"]:
         ref_time = df["AOBT_3_flt"].fillna(df["MVT_TIME_UTC_mvt"])
         local_hour = pd.Series(np.nan, index=df.index, dtype=float)
@@ -704,8 +728,9 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     active_departures_queue = compute_departures_queue(deps)
     runway_queue = compute_runway_queue(deps)
     hourly_scheduled_push_density = compute_scheduled_push_density(deps)
+    lead_wake_cat = compute_lead_wake_category(deps)
     weather = load_weather_cache()
-    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue)
+    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue, lead_wake_cat)
     predictions = np.clip(np.mean([m.predict(features) for m in models], axis=0), 0, None)
 
     template = pd.read_parquet(SUBMISSION_TEMPLATE)
@@ -773,8 +798,10 @@ def main() -> None:
     runway_queue = compute_runway_queue(dep)
     print("Computing scheduled push density...")
     hourly_scheduled_push_density = compute_scheduled_push_density(dep)
+    print("Computing lead aircraft wake turbulence category...")
+    lead_wake_cat = compute_lead_wake_category(dep)
 
-    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue)
+    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue, lead_wake_cat)
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = target <= ARTIFACT_TAXI_MAX_SEC  # artifact rows have corrupt labels
 

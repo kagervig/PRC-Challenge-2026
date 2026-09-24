@@ -1,0 +1,11 @@
+{
+    "status": "Succeeded",
+    "file": "unique-umbrella_v32.parquet",
+    "bucket": "prc-2026-unique-umbrella",
+    "used_pairs": 344841,
+    "inputs": {
+        "test_set_bucket": "prc-2026-testsets",
+        "test_set_file": "truthing.parquet"
+    },
+    "score": 307.4264
+}
