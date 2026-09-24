@@ -26,9 +26,9 @@ import pandas as pd
 import model
 import tune_harness as th
 
-# Set these to the Phase 1 winners once phase1_results.json is in; defaults reproduce v30.
+# Phase 1 winners: congestion window immaterial (kept 60); recent_delay best at 15min.
 CONG_BOXCAR_WINDOW = 60
-RECENT_BOXCAR_WINDOW = 60
+RECENT_BOXCAR_WINDOW = 15
 
 HALFLIVES = [10, 20, 30, 45, 60, 90]
 OUT = Path(os.environ.get("SWEEP_OUT", ".")) / "phase3_results.json"

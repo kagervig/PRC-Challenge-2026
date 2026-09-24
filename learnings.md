@@ -1393,6 +1393,47 @@ collinear with the raw queue, not worth the overfitting risk. Variant defs live 
 gains are small — consistent with the incremental-upside expectation; the LIRF-July wall is
 untouched.
 
+### Phase 1 — decouple + sweep the shared 60-min window (complete)
+
+Ran on Kaggle (congestion, recent_delay) + laptop (arrival_demand). Compare within each
+feature's own 60-min point; identical configs vary ~0.2s across machines, so sub-0.2s = noise.
+
+| feature | sweep (honest, by window) | best | Δ vs own 60 | decision |
+|---|---|---|---|---|
+| congestion_signal | 15:314.9 30:**314.6** 45:314.6 60:314.8 90:314.6 120:315.1 | 30 | −0.25 | **keep 60** (within noise) |
+| recent_delay | **15:314.3** 30:314.3 45:314.8 60:314.8 90:314.5 120:314.8 | 15 | **−0.55 / −0.84 clean** | **adopt 15min** |
+| arrival_demand | 15:315.0 30:315.3 45:315.3 60:**315.0** 90:315.4 120:315.5 | 60 | 0 | **keep 60** (already optimal) |
+
+**Only win: `recent_delay` window 60→15min** (−0.55 honest). Fast-changing departure-side
+disruption is best seen with a short lookback. Implementation: decouple the shared
+`CONGESTION_WINDOW_MINUTES` into per-feature constants, set recent_delay=15, others stay 60 —
+done in the combined adoption after Phase 3 (EWMA may replace recent_delay's boxcar entirely).
+
+### Phase 3 — EWMA vs boxcar (complete)
+
+Baseline = tuned boxcar (cong=60, recent=15) = 314.43 honest / 265.90 clean. EWMA computed
+stably via pandas `ewm(halflife=, times=)` on the event pool + searchsorted (the weighted-mean
+ratio is time-invariant between events, so no per-row loop / no exp overflow).
+
+| feature | EWMA sweep (honest by half-life) | best | Δ vs boxcar | decision |
+|---|---|---|---|---|
+| congestion_signal | 10:**313.86** 20:313.89 30:313.98 45:314.67 60:314.41 90:314.36 | hl10 | **−0.57 / −0.49 clean** | **adopt EWMA hl=10min** |
+| recent_delay | 10:314.45 20:314.60 30:315.02 45:315.05 60:314.72 90:315.41 | hl10 | +0.02 | **keep boxcar-15** |
+
+**Biggest phase win: `congestion_signal` → EWMA half-life 10min** (−0.57). Phase 1 found the
+congestion *window* immaterial, but smooth short-half-life decay extracts signal the hard boxcar
+misses. `recent_delay` EWMA ties boxcar-15 at best — keep the boxcar.
+
+### Combined adoptions (all phases) → IMPLEMENTED in model.py as v32 (not yet run)
+
+1. `recent_delay`: boxcar window 60 → **15min** (Phase 1)
+2. `congestion_signal`: boxcar-60 → **EWMA, half-life 10min** (Phase 3)
+3. Add **`runway_queue`** — per-runway queue length (Phase 2)
+4. `arrival_demand`: unchanged (60min)
+
+Each measured against a different baseline, so effects don't simply add. Rough stack on the
+summer-weighted metric: 315.0 → ~313.5 (~1.5s). Confirm with a full 9-seed run before submitting.
+
 ### Why this worked where earlier queue attempts didn't
 
 - "Departure queue (±30 min EOBT count)": +2.1s — a symmetric window around *planned* off-block,

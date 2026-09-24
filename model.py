@@ -13,6 +13,8 @@ from sklearn.metrics import root_mean_squared_error
 
 CONGESTION_WINDOW_MINUTES = 60       # easy to tune
 CONGESTION_WINDOW_SHORT_MINUTES = 10 # short window for acceleration signal
+CONGESTION_EWMA_HALFLIFE_MIN = 10    # v32: congestion_signal uses EWMA (beat 60min boxcar by −0.57s)
+RECENT_DELAY_WINDOW_MINUTES = 15     # v32: short lookback for recent_delay (beat 60min boxcar by −0.55s)
 SCHEDULED_PUSH_DENSITY_WINDOW_MINUTES = 30 # ±window for scheduled departure density signal
 MIN_DAY_FLIGHTS = 5  # completed flights required before day_deviation_ratio fires
 # A date-rollover artifact records AOBT and MVT_TIME a full day apart; no genuine
@@ -36,7 +38,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 31
+SUBMISSION_VERSION = 32
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -86,6 +88,7 @@ FEATURES = {
     "recent_delay":          True,   # mean AOBT-SCHED of recent departures (departure-side disruption)
     "arrival_demand":        True,   # # arrivals in preceding 60min (inbound surface pressure)
     "active_departures_queue": True, # departures pushed back but not yet airborne at pushback (queue length)
+    "runway_queue":          True,   # v32: per-runway departure queue length (−0.38s on top of airport queue)
     "hourly_scheduled_push_density": True, # count of SCHED_TIME departures at same airport ±30min of AOBT_3
     # flight plan signal
     "arvt_update_sec":       True,
@@ -229,6 +232,46 @@ def compute_congestion_signal(
     return result
 
 
+def compute_congestion_ewma(
+    departures: pd.DataFrame,
+    completed: pd.DataFrame,
+    halflife_min: float = CONGESTION_EWMA_HALFLIFE_MIN,
+) -> pd.Series:
+    """
+    Exponentially-weighted mean taxi time of same-airport completed flights, queried at each
+    departure's pushback — the EWMA counterpart of compute_congestion_signal.
+
+    Smooth decay (given half-life) instead of a hard window; a short half-life extracts
+    congestion signal the boxcar misses (v32: −0.57s vs the 60min boxcar). Computed stably with
+    pandas ewm(halflife=, times=) on the arrival pool: the weighted-mean ratio is time-invariant
+    between pool events, so each departure takes the EWMA value at the last arrival strictly
+    before its pushback (searchsorted) — no per-row loop, no exp() overflow. Returns NaN when no
+    prior arrival exists (LightGBM handles NaN natively).
+    """
+    result = pd.Series(np.nan, index=departures.index, dtype=float)
+    ref = departures["AOBT_3_flt"].fillna(departures["MVT_TIME_UTC_mvt"])
+    halflife = pd.Timedelta(minutes=halflife_min)
+    completed_valid = completed[completed["TAXITIME_SEC_mvt"].notna()]
+
+    for airport, dep_group in departures.groupby("ADEP_mvt"):
+        hist = completed_valid[completed_valid["ADEP_mvt"] == airport].sort_values("MVT_TIME_UTC_mvt")
+        if hist.empty:
+            continue
+        pt = hist["MVT_TIME_UTC_mvt"].to_numpy()
+        ewma = (
+            pd.Series(hist["TAXITIME_SEC_mvt"].to_numpy(dtype=float))
+            .ewm(halflife=halflife, times=pd.DatetimeIndex(pt))
+            .mean()
+            .to_numpy()
+        )
+        q = ref.loc[dep_group.index].to_numpy()
+        # last arrival strictly before each pushback; NaN where none exists
+        k = np.searchsorted(pt, q, side="left") - 1
+        result.loc[dep_group.index] = np.where(k >= 0, ewma[np.clip(k, 0, len(ewma) - 1)], np.nan)
+
+    return result
+
+
 def compute_day_deviation_ratio(
     departures: pd.DataFrame,
     completed: pd.DataFrame,
@@ -332,10 +375,9 @@ def compute_recent_delay(departures: pd.DataFrame, window_minutes: int) -> pd.Se
     return result
 
 
-def compute_departures_queue(departures: pd.DataFrame) -> pd.Series:
+def _departures_queue_grouped(departures: pd.DataFrame, group_cols: list) -> pd.Series:
     """
-    For each departure, count same-airport departures that had pushed back but not yet
-    taken off at its pushback instant — the length of the departure queue it joins.
+    Departure queue length (pushed back but not yet airborne at pushback), grouped by group_cols.
 
     A flight j is "active" for flight i when AOBT_j <= AOBT_i (pushed back at or before i)
     and MVT_TIME_j > AOBT_i (not yet airborne when i pushes back). The count reduces to
@@ -344,6 +386,10 @@ def compute_departures_queue(departures: pd.DataFrame) -> pd.Series:
     the number pushed back minus the number already airborne. Both terms use only events
     at or before t, so the signal is strictly causal. AOBT_3 and MVT_TIME are present in
     both training and ranking, keeping it train/serve-consistent.
+
+    Both counts come from the SAME valid-AOBT pool: a flight without an AOBT never joins the
+    queue, so it must not count as an airborne departure leaving it either — otherwise the
+    difference drifts negative across the record.
     """
     epoch = pd.Timestamp("1970-01-01", tz="UTC")
     result = pd.Series(np.nan, index=departures.index, dtype=float)
@@ -353,12 +399,8 @@ def compute_departures_queue(departures: pd.DataFrame) -> pd.Series:
     aobt_s_all = (departures["AOBT_3_flt"] - epoch).dt.total_seconds()
     mvt_s_all = (departures["MVT_TIME_UTC_mvt"] - epoch).dt.total_seconds()
 
-    for _, dep_group in departures.groupby("ADEP_mvt"):
+    for _, dep_group in departures.groupby(group_cols):
         idx = dep_group.index
-        # Pool = flights with a recorded pushback. Both the pushed-back and airborne
-        # counts must come from the SAME pool: a flight without an AOBT never joins the
-        # queue, so it must not count as an airborne departure leaving it either —
-        # otherwise the difference drifts negative across the record.
         has_aobt = aobt_s_all.loc[idx].notna().values
         aobt = np.sort(aobt_s_all.loc[idx].values[has_aobt])
         mvt = np.sort(mvt_s_all.loc[idx].values[has_aobt])
@@ -368,6 +410,16 @@ def compute_departures_queue(departures: pd.DataFrame) -> pd.Series:
         result.loc[idx] = (pushed - airborne).astype(float)
 
     return result
+
+
+def compute_departures_queue(departures: pd.DataFrame) -> pd.Series:
+    """Airport-wide departure queue length at each flight's pushback."""
+    return _departures_queue_grouped(departures, ["ADEP_mvt"])
+
+
+def compute_runway_queue(departures: pd.DataFrame) -> pd.Series:
+    """Per-runway departure queue length — the queue for the flight's specific runway (v32)."""
+    return _departures_queue_grouped(departures, ["ADEP_mvt", "RUNWAY_mvt"])
 
 
 def compute_arrival_demand(
@@ -452,6 +504,7 @@ def build_features(
     arrival_demand: pd.Series | None = None,
     active_departures_queue: pd.Series | None = None,
     hourly_scheduled_push_density: pd.Series | None = None,
+    runway_queue: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Construct the feature matrix from raw movement and flight plan columns."""
     F = FEATURES
@@ -499,6 +552,8 @@ def build_features(
         out["arrival_demand"] = arrival_demand
     if F["active_departures_queue"] and active_departures_queue is not None:
         out["active_departures_queue"] = active_departures_queue
+    if F["runway_queue"] and runway_queue is not None:
+        out["runway_queue"] = runway_queue
     if F["hourly_scheduled_push_density"] and hourly_scheduled_push_density is not None:
         out["hourly_scheduled_push_density"] = hourly_scheduled_push_density
     if F["local_hour_sin"] or F["local_hour_cos"]:
@@ -640,16 +695,17 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     # was never trained on.
     pool = build_congestion_pool(ranking)
 
-    congestion = compute_congestion_signal(deps, pool, CONGESTION_WINDOW_MINUTES)
+    congestion = compute_congestion_ewma(deps, pool, CONGESTION_EWMA_HALFLIFE_MIN)
     congestion_short = compute_congestion_signal(deps, pool, CONGESTION_WINDOW_SHORT_MINUTES)
     congestion_acceleration = congestion_short - congestion
     day_deviation = compute_day_deviation_ratio(deps, pool)
-    recent_delay = compute_recent_delay(deps, CONGESTION_WINDOW_MINUTES)
+    recent_delay = compute_recent_delay(deps, RECENT_DELAY_WINDOW_MINUTES)
     arrival_demand = compute_arrival_demand(deps, pool, CONGESTION_WINDOW_MINUTES)
     active_departures_queue = compute_departures_queue(deps)
+    runway_queue = compute_runway_queue(deps)
     hourly_scheduled_push_density = compute_scheduled_push_density(deps)
     weather = load_weather_cache()
-    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density)
+    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue)
     predictions = np.clip(np.mean([m.predict(features) for m in models], axis=0), 0, None)
 
     template = pd.read_parquet(SUBMISSION_TEMPLATE)
@@ -704,20 +760,21 @@ def main() -> None:
     print("Loading weather cache...")
     weather = load_weather_cache()
 
-    print(f"Computing congestion signal (window={CONGESTION_WINDOW_MINUTES} min)...")
-    congestion = compute_congestion_signal(dep, pool, CONGESTION_WINDOW_MINUTES)
+    print(f"Computing congestion signal (EWMA half-life={CONGESTION_EWMA_HALFLIFE_MIN} min)...")
+    congestion = compute_congestion_ewma(dep, pool, CONGESTION_EWMA_HALFLIFE_MIN)
     congestion_short = compute_congestion_signal(dep, pool, CONGESTION_WINDOW_SHORT_MINUTES)
     congestion_acceleration = congestion_short - congestion
     print(f"Computing day deviation ratio (min_flights={MIN_DAY_FLIGHTS})...")
     day_deviation = compute_day_deviation_ratio(dep, pool)
-    print("Computing recent-delay and arrival-demand signals...")
-    recent_delay = compute_recent_delay(dep, CONGESTION_WINDOW_MINUTES)
+    print(f"Computing recent-delay (window={RECENT_DELAY_WINDOW_MINUTES} min) and arrival-demand signals...")
+    recent_delay = compute_recent_delay(dep, RECENT_DELAY_WINDOW_MINUTES)
     arrival_demand = compute_arrival_demand(dep, pool, CONGESTION_WINDOW_MINUTES)
     active_departures_queue = compute_departures_queue(dep)
+    runway_queue = compute_runway_queue(dep)
     print("Computing scheduled push density...")
     hourly_scheduled_push_density = compute_scheduled_push_density(dep)
 
-    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density)
+    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue)
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = target <= ARTIFACT_TAXI_MAX_SEC  # artifact rows have corrupt labels
 
