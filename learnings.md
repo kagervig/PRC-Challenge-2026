@@ -1507,3 +1507,40 @@ regulations, NOTAMs, convective weather).**
 - This version: actual `AOBT`/`MVT_TIME`, strictly backward, evaluated on the whole val slice.
   The gain is broad-airport (EGLL) surface congestion, not the LIRF-July tail — consistent with
   the earlier finding that the LIRF collapse is invisible to any volume/queue proxy.
+
+### Phase 5 result — gate-hold backlog (overdue-pushback queue) SUCCEEDS broadly, LIRF flat (2026-09-24)
+
+Built the "cumulative undischarged queue": at each flight's pushback `t`, count same-(airport,
+runway) flights overdue at the gate — `EOBT_j <= t < AOBT_j` (planned off-block passed, not yet
+actually pushed). This is the interval-stabbing count `|{EOBT<=t}| - |{AOBT<=t}|` over
+well-formed intervals (EOBT<=AOBT, capped 2h to drop day-rollover AOBT artifacts); causal (only
+counts of past events at `t`, never the future AOBT value) and serve-consistent (EOBT_1, AOBT_3
+both in the ranking set). Distinct from `active_departures_queue`/`runway_queue`, which count the
+*taxiway* queue (pushed, not airborne) — this counts the *gate* backlog (overdue, not pushed).
+
+A/B on the summer-weighted harness vs the v33 baseline (313.30):
+
+| + variant | honest Δ | LIRF |
+|---|---|---|
+| overdue_queue_2h (airport) | −1.05 | 756.9 (flat) |
+| overdue_queue_uncapped (airport) | −1.02 | 757.0 (flat) |
+| overdue_runway_2h | **−1.30** | 757.4 (flat) |
+| all_three | −1.32 | 757.2 (flat) |
+
+**Adopted `overdue_runway_queue` (per-runway, 2h cap) as v34** — biggest single-feature harness
+gain since the v28 era; `all_three` added only −0.02 over runway-alone (noise) for two redundant
+features, so the parsimonious single feature wins. The 2h cap never binds once null-AOBT rows are
+dropped (capped == uncapped exactly), but is kept as a guard.
+
+**Board-confirmed (2026-09-24): v34 = 304.9528, −2.06 vs v33 (307.0102)** — biggest single-version
+board gain since the v28 era. The harness (−1.30) correctly ranked it a strong feature but
+*under*-stated the magnitude: the harness is conservative, not optimistic. Best score to date.
+
+**The pitch was wrong; the feature is right.** It was proposed to close the LIRF gate-hold tail —
+but LIRF is dead flat (756.7 -> 757.4, marginally worse). The entire gain is LFPG/EGLL broad-airport
+surface congestion, same character as `active_departures_queue`. This re-confirms the standing
+verdict for the *third* time (v29 queue, Phase 4 runway, now Phase 5 gate-hold): **no
+volume/queue/backlog proxy computed from data on hand moves the LIRF-July collapse** — it needs
+external ATC flow-control / regulation inputs. But unlike Phase 4, this one earns its place because
+it lifts the *rest* of the board. Verify at full config before submitting (harness lr=0.05/600 is a
+ranking proxy, not the lr=0.02/3000 model).

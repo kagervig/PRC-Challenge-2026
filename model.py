@@ -15,6 +15,7 @@ CONGESTION_WINDOW_MINUTES = 60       # easy to tune
 CONGESTION_WINDOW_SHORT_MINUTES = 10 # short window for acceleration signal
 CONGESTION_EWMA_HALFLIFE_MIN = 10    # v32: congestion_signal uses EWMA (beat 60min boxcar by −0.57s)
 RECENT_DELAY_WINDOW_MINUTES = 15     # v32: short lookback for recent_delay (beat 60min boxcar by −0.55s)
+OVERDUE_QUEUE_MAX_SEC = 7200         # v34: cap on overdue-pushback intervals (drops day-rollover AOBT artifacts)
 SCHEDULED_PUSH_DENSITY_WINDOW_MINUTES = 30 # ±window for scheduled departure density signal
 MIN_DAY_FLIGHTS = 5  # completed flights required before day_deviation_ratio fires
 # A date-rollover artifact records AOBT and MVT_TIME a full day apart; no genuine
@@ -38,7 +39,7 @@ TRAINING_FILES = sorted(glob.glob(str(DATA_DIR / "training_*.parquet")))
 RANKING_FILE = DATA_DIR / "ranking.parquet"
 SUBMISSION_TEMPLATE = DATA_DIR / "submitting.parquet"
 TEAM_NAME = "unique-umbrella"
-SUBMISSION_VERSION = 33
+SUBMISSION_VERSION = 34
 WEATHER_CACHE = DATA_DIR / "weather_cache.parquet"
 
 FEATURE_FRACTION = 0.8
@@ -89,6 +90,7 @@ FEATURES = {
     "arrival_demand":        True,   # # arrivals in preceding 60min (inbound surface pressure)
     "active_departures_queue": True, # departures pushed back but not yet airborne at pushback (queue length)
     "runway_queue":          True,   # v32: per-runway departure queue length (−0.38s on top of airport queue)
+    "overdue_runway_queue":  True,   # v34: per-runway gate-hold backlog (EOBT passed, not yet pushed) (−1.30s harness)
     "hourly_scheduled_push_density": True, # count of SCHED_TIME departures at same airport ±30min of AOBT_3
     # wake turbulence
     "prior_flight_wake_cat": True,   # WK_TBL_CAT of immediately preceding departure on same (airport, runway)
@@ -425,6 +427,53 @@ def compute_runway_queue(departures: pd.DataFrame) -> pd.Series:
     return _departures_queue_grouped(departures, ["ADEP_mvt", "RUNWAY_mvt"])
 
 
+def _overdue_queue_grouped(departures: pd.DataFrame, group_cols: list) -> pd.Series:
+    """
+    Gate-hold backlog: flights whose planned pushback has passed but which have not yet
+    actually pushed back, at each flight's pushback time t, grouped by group_cols.
+
+    Where active_departures_queue counts the taxiway queue (pushed, not yet airborne), this
+    counts the overdue-at-the-gate pool that ATC gate-holding inflates: a flight j is overdue
+    for flight i when EOBT_j <= t < AOBT_j (planned off-block passed, actual off-block still
+    ahead), an interval [EOBT_j, AOBT_j) covering t. The stabbing count reduces to two
+    strictly-backward cumulative counts:
+        overdue = |{EOBT_j <= t}| - |{AOBT_j <= t}|
+    Both terms only read events observed at or before t (how many EOBTs have passed, how many
+    flights have actually pushed by now); the future AOBT value is never used, only its count
+    <= t, so the signal is causal. EOBT_1 and AOBT_3 are present in both training and ranking,
+    keeping it train/serve-consistent.
+
+    Only well-formed overdue intervals contribute: EOBT_j <= AOBT_j (early pushes were never
+    overdue) and shorter than OVERDUE_QUEUE_MAX_SEC (bounds day-rollover AOBT artifacts, which
+    would otherwise register as forever-overdue). Flights that never push (AOBT null) drop out.
+    """
+    epoch = pd.Timestamp("1970-01-01", tz="UTC")
+    result = pd.Series(np.nan, index=departures.index, dtype=float)
+
+    ref_s_all = (departures["AOBT_3_flt"].fillna(departures["MVT_TIME_UTC_mvt"]) - epoch).dt.total_seconds()
+    eobt_s_all = (departures["EOBT_1_flt"] - epoch).dt.total_seconds()
+    aobt_s_all = (departures["AOBT_3_flt"] - epoch).dt.total_seconds()
+
+    for _, dep_group in departures.groupby(group_cols):
+        idx = dep_group.index
+        eobt = eobt_s_all.loc[idx].values
+        aobt = aobt_s_all.loc[idx].values
+        valid = (~np.isnan(eobt) & ~np.isnan(aobt)
+                 & (eobt <= aobt) & (aobt - eobt <= OVERDUE_QUEUE_MAX_SEC))
+        starts = np.sort(eobt[valid])
+        ends = np.sort(aobt[valid])
+        t = ref_s_all.loc[idx].values
+        overdue = np.searchsorted(starts, t, side="right") - np.searchsorted(ends, t, side="right")
+        result.loc[idx] = overdue.astype(float)
+
+    return result
+
+
+def compute_overdue_runway_queue(departures: pd.DataFrame) -> pd.Series:
+    """Per-runway gate-hold backlog — overdue-but-not-pushed flights on the flight's runway (v34)."""
+    return _overdue_queue_grouped(departures, ["ADEP_mvt", "RUNWAY_mvt"])
+
+
 def compute_arrival_demand(
     departures: pd.DataFrame, arrival_pool: pd.DataFrame, window_minutes: int
 ) -> pd.Series:
@@ -527,6 +576,7 @@ def build_features(
     hourly_scheduled_push_density: pd.Series | None = None,
     runway_queue: pd.Series | None = None,
     lead_wake_cat: pd.Series | None = None,
+    overdue_runway_queue: pd.Series | None = None,
 ) -> pd.DataFrame:
     """Construct the feature matrix from raw movement and flight plan columns."""
     F = FEATURES
@@ -576,6 +626,8 @@ def build_features(
         out["active_departures_queue"] = active_departures_queue
     if F["runway_queue"] and runway_queue is not None:
         out["runway_queue"] = runway_queue
+    if F["overdue_runway_queue"] and overdue_runway_queue is not None:
+        out["overdue_runway_queue"] = overdue_runway_queue
     if F["hourly_scheduled_push_density"] and hourly_scheduled_push_density is not None:
         out["hourly_scheduled_push_density"] = hourly_scheduled_push_density
     if F["prior_flight_wake_cat"] and lead_wake_cat is not None:
@@ -727,10 +779,11 @@ def write_submission(models: list[lgb.Booster], version: int) -> Path:
     arrival_demand = compute_arrival_demand(deps, pool, CONGESTION_WINDOW_MINUTES)
     active_departures_queue = compute_departures_queue(deps)
     runway_queue = compute_runway_queue(deps)
+    overdue_runway_queue = compute_overdue_runway_queue(deps)
     hourly_scheduled_push_density = compute_scheduled_push_density(deps)
     lead_wake_cat = compute_lead_wake_category(deps)
     weather = load_weather_cache()
-    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue, lead_wake_cat)
+    features = build_features(deps, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue, lead_wake_cat, overdue_runway_queue)
     predictions = np.clip(np.mean([m.predict(features) for m in models], axis=0), 0, None)
 
     template = pd.read_parquet(SUBMISSION_TEMPLATE)
@@ -796,12 +849,13 @@ def main() -> None:
     arrival_demand = compute_arrival_demand(dep, pool, CONGESTION_WINDOW_MINUTES)
     active_departures_queue = compute_departures_queue(dep)
     runway_queue = compute_runway_queue(dep)
+    overdue_runway_queue = compute_overdue_runway_queue(dep)
     print("Computing scheduled push density...")
     hourly_scheduled_push_density = compute_scheduled_push_density(dep)
     print("Computing lead aircraft wake turbulence category...")
     lead_wake_cat = compute_lead_wake_category(dep)
 
-    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue, lead_wake_cat)
+    features = build_features(dep, congestion, day_deviation, congestion_acceleration, weather, recent_delay, arrival_demand, active_departures_queue, hourly_scheduled_push_density, runway_queue, lead_wake_cat, overdue_runway_queue)
     target = dep["TAXITIME_SEC_mvt"].astype(float)
     is_clean = target <= ARTIFACT_TAXI_MAX_SEC  # artifact rows have corrupt labels
 

@@ -56,10 +56,12 @@ def prepare(dep, pool, weather, extra=None):
     arrdem = model.compute_arrival_demand(dep, pool, model.CONGESTION_WINDOW_MINUTES)
     queue = model.compute_departures_queue(dep)
     runway_queue = model.compute_runway_queue(dep)
+    overdue_runway_queue = model.compute_overdue_runway_queue(dep)
     sched = model.compute_scheduled_push_density(dep)
     lead_wake = model.compute_lead_wake_category(dep)
     feats = model.build_features(dep, cong, dayd, cong_short - cong, weather,
-                                 recent, arrdem, queue, sched, runway_queue, lead_wake)
+                                 recent, arrdem, queue, sched, runway_queue, lead_wake,
+                                 overdue_runway_queue)
     if extra:
         for col, series in extra.items():
             feats[col] = series
